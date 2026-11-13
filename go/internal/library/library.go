@@ -1,0 +1,1683 @@
+// Package library 负责曲库：目录扫描、元数据缓存、过滤、文件夹监听。
+package library
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"localmusicplayer/internal/atomicfile"
+	"localmusicplayer/internal/bootstrap"
+	"localmusicplayer/internal/covercache"
+	"localmusicplayer/internal/ffmpeg"
+	"localmusicplayer/internal/filter"
+	"localmusicplayer/internal/meta"
+)
+
+// ScanResult 一次扫描的结果统计
+type ScanResult struct {
+	Found    int   `json:"found"`
+	Kept     int   `json:"kept"`
+	Excluded int   `json:"excluded"`
+	Added    int   `json:"added"`
+	Removed  int   `json:"removed"`
+	At       int64 `json:"at"`
+}
+
+// ProgressFunc 扫描进度回调（进度阶段、当前、总数）
+type ProgressFunc func(phase string, current, total int)
+
+// cacheEntry 元数据缓存条目。
+// 字段必须是「导出 + JSON tag」的：早先用未导出小写字段，
+// encoding/json 会把每个条目序列化成 {}，缓存实际上从未生效
+// （表现为每次重扫都把全部文件的标签重新解析一遍）。
+type cacheEntry struct {
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album"`
+	Duration int64  `json:"duration"`
+	Sample   int    `json:"sample"`
+	Bitrate  int    `json:"bitrate"`
+	// CoverFile 是封面缓存目录里的文件名（内容 hash 命名，见 internal/covercache）。
+	// 空字符串表示这首歌没有内嵌封面。
+	//
+	// ★ 这里以前是 Cover string（完整的 base64 data URL）—— 实测那份 5.59MB 的
+	// 元数据缓存里 99.6% 是它，而同一张专辑封面会被逐首重复存 N 份。
+	CoverFile string `json:"coverFile,omitempty"`
+	// Cover 是 v1 遗留字段，只用于**一次性迁移**（读进来解码成图片塞进封面缓存，
+	// 然后置空）；新写入的缓存永远是空的。见 migrateLegacyCovers。
+	Cover   string `json:"cover,omitempty"`
+	ModTime int64  `json:"modTime"`
+	Size    int64  `json:"size"`
+	// Probed 表示「已经用 ffmpeg 探测过且确实拿不到时长」。
+	// 没有这个标记的话，每次重扫都会对同一批无时长文件反复起 ffmpeg 进程。
+	Probed bool `json:"probed,omitempty"`
+}
+
+// Manager 曲库管理器，方法均可并发调用
+type Manager struct {
+	mu      sync.RWMutex
+	songs   map[string]bootstrap.Song // id -> song
+	folders []bootstrap.Folder
+	cache   map[string]cacheEntry
+	cacheMu sync.RWMutex
+	// cacheOnce 保证磁盘上的缓存只读一次（懒加载，见 ensureCacheLoaded）
+	cacheOnce sync.Once
+	scanning  bool
+
+	// sortedSnapshot 是 songs 的「按 AddedAt 倒序」快照，由 Songs() 使用。
+	//
+	// 为什么需要它：songs 是 map，迭代顺序随机，所以想按添加时间倒序返回就
+	// **必须**每次排序。而 Songs() 被 6 处调用（Wails 绑定、Stats、响度 State/
+	// MeasureAll/GainMap/AlbumGains），其中 GainMap 与 AlbumGains 还是相邻调用。
+	// 实测（10,000 首）：每次调用 2.48ms / 分配 1.84MB，其中排序占约 5/6。
+	//
+	// 失效方式：任何改动 songs 的地方都要调 markSongsDirty()。约定与前端
+	// store.js 的 songIndex 一致 —— 只在「曲库整体替换或增量增删」时重建。
+	sortedSnapshot []bootstrap.Song
+	songsDirty     bool
+
+	// 扫描串行化：idle 在「没有任何扫描进行中」时是关闭状态
+	scanMu sync.Mutex
+	idle   chan struct{}
+
+	// metaReads 实际读取文件元数据的次数（命中缓存不计），用于测试与诊断
+	metaReads int64
+
+	// cacheUsable 表示磁盘上的元数据缓存**或者**「它不存在」这件事实已经确认过。
+	// 读失败 / JSON 解析失败时为 false —— 此时内存里的表是空的，但它不是真相。
+	cacheUsable bool
+
+	// 依赖
+	store *bootstrap.Store
+	// covers 是内嵌封面的内容寻址缓存（hash 命名，专用目录）
+	covers *covercache.Store
+
+	// 回调
+	onProgress ProgressFunc
+	onChanged  func(ScanResult)
+}
+
+// NewManager 创建曲库管理器
+func NewManager(store *bootstrap.Store) *Manager {
+	m := &Manager{
+		songs: map[string]bootstrap.Song{},
+		cache: map[string]cacheEntry{},
+		store: store,
+	}
+	m.folders = store.Get().EffectiveFolders()
+	// 专用封面缓存目录：<cacheDir>/covers。
+	// 与 metacache 的 <cacheDir>/meta/covers 分开：那边是「用户管理过的封面」
+	// （联网抓取 / 手动换 / 写回文件），有自己的索引与删除语义；这里是「从文件
+	// 标签里解析出来的封面」，纯内容寻址、无索引、由扫描自动重建。
+	m.covers = covercache.New(filepath.Join(store.Get().CacheDir, "covers"))
+	// 元数据缓存**不在这里读**：它是 5.9MB 的 JSON（99% 是内嵌封面的 base64），
+	// 同步 json.Unmarshal 会发生在 main() 建窗口之前，是首屏里最贵的一段。
+	// 改成第一次真正用到缓存时再读（扫描 / 保存），见 ensureCacheLoaded。
+	return m
+}
+
+/* --------------------------------------------------------------------------
+   扫描串行化
+   --------------------------------------------------------------------------
+   同一次运行里可能有多个扫描来源：启动扫描、用户点「重新扫描」、
+   新增文件夹后的自动扫描、文件夹监听触发的增量重扫。
+   它们不能并行（会互相覆盖 songs 表），也不能直接丢弃后到的请求
+   ——否则前端会一直等不到 scan:done 事件，界面停在空白。
+   因此这里让后到的请求「排队等前一个跑完，再跑自己的」。
+   -------------------------------------------------------------------------- */
+
+// beginScan 标记扫描开始；若已有扫描在进行会先等到它结束
+func (m *Manager) beginScan(ctx context.Context) error {
+	for {
+		m.scanMu.Lock()
+		if m.idle == nil {
+			m.idle = make(chan struct{})
+			m.mu.Lock()
+			m.scanning = true
+			m.mu.Unlock()
+			m.scanMu.Unlock()
+			return nil
+		}
+		wait := m.idle
+		m.scanMu.Unlock()
+
+		// 已有扫描在跑：等它结束（或调用方取消）
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// endScan 标记扫描结束并唤醒排队者
+func (m *Manager) endScan() {
+	m.scanMu.Lock()
+	m.mu.Lock()
+	m.scanning = false
+	m.mu.Unlock()
+	if m.idle != nil {
+		close(m.idle)
+		m.idle = nil
+	}
+	m.scanMu.Unlock()
+}
+
+// IsScanning 是否有扫描在进行
+func (m *Manager) IsScanning() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.scanning
+}
+
+// MetaReads 统计真正读取文件元数据的次数（命中缓存不计）。
+// 用于验证缓存确实生效，以及排查「重扫很慢」类问题。
+func (m *Manager) MetaReads() int64 {
+	return atomic.LoadInt64(&m.metaReads)
+}
+
+// SetProgressFunc 注册扫描进度回调
+func (m *Manager) SetProgressFunc(fn ProgressFunc) {
+	m.mu.Lock()
+	m.onProgress = fn
+	m.mu.Unlock()
+}
+
+// SetChangedFunc 注册曲库变化回调
+func (m *Manager) SetChangedFunc(fn func(ScanResult)) {
+	m.mu.Lock()
+	m.onChanged = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) report(phase string, current, total int) {
+	m.mu.RLock()
+	fn := m.onProgress
+	m.mu.RUnlock()
+	if fn != nil {
+		fn(phase, current, total)
+	}
+}
+
+func (m *Manager) notifyChanged(res ScanResult) {
+	m.mu.RLock()
+	fn := m.onChanged
+	m.mu.RUnlock()
+	if fn != nil {
+		fn(res)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   元数据缓存（落盘为 JSON，放在数据目录）
+   -------------------------------------------------------------------------- */
+
+type cacheFile struct {
+	Version int                   `json:"version"`
+	Entries map[string]cacheEntry `json:"entries"`
+}
+
+const cacheVersion = 1
+
+func (m *Manager) cachePath() string {
+	return filepath.Join(m.store.DataDir(), "metadata-cache.json")
+}
+
+// ensureCacheLoaded 保证磁盘上的元数据缓存已经读过一次（懒加载）。
+func (m *Manager) ensureCacheLoaded() {
+	m.cacheOnce.Do(m.loadCache)
+}
+
+// scanCancelledErr 把「上下文已取消」统一成一个非 nil 的错误。
+func scanCancelledErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return context.Canceled
+}
+
+// loadCache 读磁盘上的元数据缓存。
+//
+// ★ 关键约定：**读失败时必须把 cacheUsable 留成 false**。
+//
+// 以前这里四条件都是「静默 return」，于是「磁盘上的缓存读不动」与
+// 「这台机器从来没有缓存」在内存里长得一模一样（都是空表）。而 SaveCache
+// 最后会把这个空表整份写回 metadata-cache.json、pruneCoverCache 又会拿它当
+// 「没有任何封面仍被引用」的依据去回收 —— 一次瞬时读失败（杀软扫描占住文件、
+// 并发写、跨机器拷贝中）就足以让用户的整份元数据缓存**与全部内嵌封面文件**
+// 一起消失。这与用户报的「缓存数据莫名消失」是同一类事故，必须有硬保护。
+func (m *Manager) loadCache() {
+	raw, err := os.ReadFile(m.cachePath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// 首次运行：空表确实就是真相
+			m.cacheMu.Lock()
+			m.cacheUsable = true
+			m.cacheMu.Unlock()
+			return
+		}
+		m.markCacheUnusable("读取", err)
+		return
+	}
+	var cf cacheFile
+	if err := json.Unmarshal(raw, &cf); err != nil {
+		m.markCacheUnusable("解析", err)
+		return
+	}
+	if cf.Version != cacheVersion || cf.Entries == nil {
+		m.markCacheUnusable("版本/结构不符", nil)
+		return
+	}
+	m.cacheMu.Lock()
+	m.cache = cf.Entries
+	m.cacheUsable = true
+	m.cacheMu.Unlock()
+
+	// v1 → v2：把 base64 封面搬进内容寻址的封面缓存目录
+	m.migrateLegacyCovers()
+}
+
+// markCacheUnusable 记录「这份缓存这次没能用起来」，并把坏文件留一份现场。
+//
+// 只备份不改写：备份文件是排查用的，绝不覆盖原文件（下一次启动可能就读得动了）。
+func (m *Manager) markCacheUnusable(action string, cause error) {
+	m.cacheMu.Lock()
+	m.cacheUsable = false
+	m.cacheMu.Unlock()
+	log.Printf("[library] 元数据缓存%s失败，本次运行只读不写（不会覆盖磁盘上的缓存）: %v", action, cause)
+	if action == "解析" {
+		if raw, err := os.ReadFile(m.cachePath()); err == nil {
+			_ = os.WriteFile(m.cachePath()+".broken", raw, 0o644)
+		}
+	}
+}
+
+// cacheIsUsable 当前内存里的元数据缓存是否可以作为「磁盘真相」写回去。
+func (m *Manager) cacheIsUsable() bool {
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+	return m.cacheUsable
+}
+
+// migrateLegacyCovers 把 v1 元数据缓存里的 base64 封面搬进封面缓存目录。
+//
+// 为什么必须**就地迁移**，而不是「直接丢掉 legacy 字段、等下次重扫」：缓存命中
+// 路径只要 ModTime/Size 没变就认为记录仍然有效，不会再打开文件去解析封面 ——
+// 于是老用户会在文件毫无变化的情况下**永久失去封面**。
+func (m *Manager) migrateLegacyCovers() {
+	type item struct {
+		path string
+		data []byte
+		mime string
+	}
+
+	var todo []item
+	m.cacheMu.Lock()
+	for path, entry := range m.cache {
+		if entry.Cover == "" {
+			continue
+		}
+		if entry.CoverFile != "" {
+			// 已经迁移过，只清掉体积大的遗留字段
+			entry.Cover = ""
+			m.cache[path] = entry
+			continue
+		}
+		data, mime, ok := decodeDataURL(entry.Cover)
+		if !ok {
+			// 坏数据：清掉字段，别让它继续占体积
+			entry.Cover = ""
+			m.cache[path] = entry
+			continue
+		}
+		todo = append(todo, item{path: path, data: data, mime: mime})
+	}
+	m.cacheMu.Unlock()
+
+	if len(todo) == 0 {
+		return
+	}
+	migrated := 0
+	for _, it := range todo {
+		name, err := m.covers.Put(it.data, it.mime)
+		if err != nil {
+			log.Printf("[library] 迁移封面失败（%s）: %v", it.path, err)
+			continue
+		}
+		m.cacheMu.Lock()
+		if entry, ok := m.cache[it.path]; ok {
+			entry.CoverFile = name
+			entry.Cover = ""
+			m.cache[it.path] = entry
+			migrated++
+		}
+		m.cacheMu.Unlock()
+	}
+	log.Printf("[library] 已把 %d 首的内嵌封面从 base64 迁移到内容寻址缓存（%s）", migrated, m.covers.Dir())
+}
+
+// decodeDataURL 解析 "data:image/jpeg;base64,xxxx"（只用于 v1 缓存迁移）。
+func decodeDataURL(s string) ([]byte, string, bool) {
+	comma := strings.IndexByte(s, ',')
+	if comma < 0 {
+		return nil, "", false
+	}
+	head := s[:comma]
+	if !strings.HasPrefix(head, "data:") || !strings.Contains(head, "base64") {
+		return nil, "", false
+	}
+	mime := strings.TrimSuffix(strings.TrimPrefix(head, "data:"), ";base64")
+	data, err := base64.StdEncoding.DecodeString(s[comma+1:])
+	if err != nil || len(data) == 0 {
+		return nil, "", false
+	}
+	return data, mime, true
+}
+
+// CoversDir 返回内嵌封面缓存目录（供设置界面显示）。
+func (m *Manager) CoversDir() string { return m.covers.Dir() }
+
+// CoversHandler 返回 /cover/ 前缀的处理器（main.go 的中间件把它挂到同源 asset server）。
+func (m *Manager) CoversHandler() http.Handler { return m.covers.Handler() }
+
+// CoversStats 返回内嵌封面缓存的文件数与总字节数。
+func (m *Manager) CoversStats() (int, int64) { return m.covers.Stats() }
+
+// SaveCache 把元数据缓存落盘（扫描结束后调用）
+func (m *Manager) SaveCache() error {
+	// 保存前必须已经读过磁盘上的旧缓存：缓存现在是懒加载的，
+	// 少了这一步就会把上一次的全部条目直接覆盖成「只有本次扫描碰过的那些」。
+	m.ensureCacheLoaded()
+	// 载入失败时直接放弃本次保存：内存里的空表不是真相，
+	// 写回去就等于把用户的元数据缓存（以及它引用的封面）整份抹掉。
+	if !m.cacheIsUsable() {
+		return fmt.Errorf("元数据缓存未能载入，已跳过本次保存以免覆盖磁盘上的缓存")
+	}
+	// 与 loudness.Save 同样的理由：map 是引用类型，必须在锁内复制 ——
+	// 否则下面 json.Marshal 会无锁遍历 m.cache，而扫描 worker 仍在写它。
+	// 目前靠 beginScan/endScan 串行化侥幸不触发，但那是隐式约定，不该依赖。
+	m.cacheMu.RLock()
+	entries := make(map[string]cacheEntry, len(m.cache))
+	for k, v := range m.cache {
+		entries[k] = v
+	}
+	m.cacheMu.RUnlock()
+
+	// 用 Marshal 而不是 MarshalIndent：这份文件里 99% 是内嵌封面的 base64，
+	// 缩进既不可读也白花 CPU（实测这份缓存 5.6MB）。
+	raw, err := json.Marshal(cacheFile{Version: cacheVersion, Entries: entries})
+	if err != nil {
+		return err
+	}
+	if err := atomicfile.Write(m.cachePath(), raw, 0o644); err != nil {
+		return err
+	}
+	// 顺手回收不再被引用的封面文件（内容寻址的目录只增不减，必须有这一步）。
+	m.pruneCoverCache()
+	return nil
+}
+
+// pruneCoverCache 删掉不再被任何元数据条目引用的封面文件。
+//
+// 孤儿是怎么来的：用户在歌曲文件里换了内嵌封面、或删掉了歌 → 元数据条目的
+// CoverFile 换成新的（或整条消失），旧图就没人引用了。
+//
+// 1 小时的年龄门槛是给「刚写完还没登记进元数据缓存」的文件留的窗口 ——
+// 那种文件此刻必然不在 keep 里，不该被当成孤儿删掉。
+func (m *Manager) pruneCoverCache() {
+	// 载入失败时内存里的表是空的，用它当 keep 会把**所有**封面都判成孤儿删掉。
+	if !m.cacheIsUsable() {
+		return
+	}
+	m.cacheMu.RLock()
+	keep := make(map[string]struct{}, len(m.cache))
+	for _, entry := range m.cache {
+		if entry.CoverFile != "" {
+			keep[entry.CoverFile] = struct{}{}
+		}
+	}
+	m.cacheMu.RUnlock()
+
+	removed, freed := m.covers.Prune(keep, time.Hour)
+	if removed > 0 {
+		log.Printf("[library] 回收了 %d 个不再被引用的封面文件（%.1f KB）", removed, float64(freed)/1024)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   查询
+   -------------------------------------------------------------------------- */
+
+// markSongsDirtyLocked 标记排序快照需要重建。**调用方必须持有 m.mu 写锁。**
+func (m *Manager) markSongsDirtyLocked() { m.songsDirty = true }
+
+// Songs 返回过滤后的全部歌曲（按添加时间倒序，与前端默认排序一致）。
+//
+// 返回的是一份**拷贝**：调用方（以及 Wails 的序列化层）可以安全持有。
+// 排序结果按「曲库是否变过」缓存 —— map 的迭代顺序随机，所以排序本身无法省，
+// 但可以只在曲库真的变化时做一次（见 Manager.sortedSnapshot 的说明）。
+func (m *Manager) Songs() []bootstrap.Song {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.songsDirty || m.sortedSnapshot == nil {
+		out := make([]bootstrap.Song, 0, len(m.songs))
+		for _, s := range m.songs {
+			out = append(out, s)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].AddedAt > out[j].AddedAt })
+		m.sortedSnapshot = out
+		m.songsDirty = false
+	}
+
+	// 仍然拷贝一份给调用方：快照必须保持不可变，否则调用方一改就污染后续所有请求。
+	// 这一份拷贝是必要的代价（实测 10k 首约 0.5ms）；排序那 2ms 才是省下来的大头。
+	//
+	// ★ 必须返回**非 nil** 的空切片，不能用 `append([]Song(nil), …)`：
+	// Go 的 nil 切片经 Wails 序列化成 JSON `null`，而前端对这几个绑定一律是
+	// 「`if (Array.isArray(x))` 才更新状态」，`null` 被当成「这次没拿到数据」，
+	// 于是**保留旧列表**。真实故障：把下载目录里的歌删干净再重扫，曲库已经是空的，
+	// 界面上的歌却还在（直到播放时才报「文件不存在」）。
+	out := make([]bootstrap.Song, len(m.sortedSnapshot))
+	copy(out, m.sortedSnapshot)
+	return out
+}
+
+// SongByID 按 id 取歌曲
+func (m *Manager) SongByID(id string) (bootstrap.Song, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.songs[id]
+	return s, ok
+}
+
+// DropSong 把一首歌从曲库里摘掉（**不动磁盘文件**），返回是否确实移除了。
+//
+// 用途见 services_unplayable.go：播放时确认放不出来的文件不该继续留在
+// 曲库里 —— 留着只会让用户每次点到都再失败一次（那正是错误提示刷屏的来源）。
+//
+// ★ 元数据缓存条目也必须一起清掉，否则摘了等于没摘：
+//
+//	下次扫描会命中缓存 → 认为「这个文件没变，复用旧元数据」→ 这首歌又回到
+//	曲库里。用户看到的现象就是「移除之后一扫描它又回来了」。
+//	清掉条目才会真正重新读文件（而重读时若仍解析失败，扫描本来就会跳过它）。
+//
+// 注意这不改变「扫描以磁盘为准」的原则：文件仍在磁盘上、仍会被遍历到，
+// 只是元数据要重新读一遍。用户修好文件后重新扫描，它就正常回来了。
+func (m *Manager) DropSong(id string) bool {
+	if id == "" {
+		return false
+	}
+	m.mu.Lock()
+	song, ok := m.songs[id]
+	if ok {
+		delete(m.songs, id)
+		// ★ 必须标记快照失效，否则 Songs() 会继续返回已经摘掉的那首
+		// （sortedSnapshot 是拷贝，不会跟着 map 的删除自动更新）。
+		m.markSongsDirtyLocked()
+	}
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+
+	if song.Path != "" {
+		m.cacheMu.Lock()
+		delete(m.cache, song.Path)
+		m.cacheMu.Unlock()
+	}
+	return true
+}
+
+// Folders 返回当前文件夹列表（含曲目数统计）。
+//
+// 与 Songs 同理：空列表也必须返回非 nil 切片（nil 会序列化成 JSON null，
+// 前端会把它当成「没拿到数据」而保留旧列表）。
+func (m *Manager) Folders() []bootstrap.Folder {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]bootstrap.Folder, len(m.folders))
+	copy(out, m.folders)
+	return out
+}
+
+// ReloadFolders 重新从配置读取文件夹列表。
+// 新增/移除文件夹后必须调用，否则 Manager 里缓存的副本不会更新，
+// 扫描就仍然只扫旧目录（表现为「加了文件夹却扫不到歌」）。
+//
+// 这里用的是 Config.EffectiveFolders（用户文件夹 + 下载目录），
+// 所以「改了下载路径」之后调用它，新目录就会被纳入扫描范围。
+func (m *Manager) ReloadFolders() {
+	next := m.store.Get().EffectiveFolders()
+	m.mu.Lock()
+	m.folders = append([]bootstrap.Folder(nil), next...)
+	m.mu.Unlock()
+}
+
+// sameFolders 判断两份文件夹列表是否等价（只比较会影响扫描的字段）
+func sameFolders(a, b []bootstrap.Folder) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || !strings.EqualFold(a[i].Path, b[i].Path) {
+			return false
+		}
+	}
+	return true
+}
+
+/* --------------------------------------------------------------------------
+   扫描
+   -------------------------------------------------------------------------- */
+
+type candidate struct {
+	path   string
+	size   int64
+	ext    string
+	folder string
+	mod    int64
+}
+
+// Scan 全量扫描所有配置的文件夹。
+// force=true 时忽略元数据缓存（用于用户点「重新扫描」并希望刷新标签的场景）。
+//
+// 若已有扫描在进行，本调用会先排队等它结束再执行自己的扫描
+// （不能直接丢弃：调用方在等 scan:done 事件）。
+func (m *Manager) Scan(ctx context.Context, force bool) (ScanResult, error) {
+	if err := m.beginScan(ctx); err != nil {
+		return ScanResult{}, err
+	}
+	defer m.endScan()
+	m.ensureCacheLoaded()
+
+	m.mu.RLock()
+	folders := append([]bootstrap.Folder(nil), m.folders...)
+	m.mu.RUnlock()
+
+	// 自愈：配置里的文件夹列表（含下载目录）才是真源。若外部改过配置却忘了通知曲库，
+	// 这里补一次同步，避免「加了文件夹却扫不到歌」「改了下载路径却扫不到下载的歌」。
+	if cfgFolders := m.store.Get().EffectiveFolders(); !sameFolders(folders, cfgFolders) {
+		m.ReloadFolders()
+		m.mu.RLock()
+		folders = append([]bootstrap.Folder(nil), m.folders...)
+		m.mu.RUnlock()
+	}
+
+	concurrency := m.store.Get().ScanConcurrency
+
+	m.report("walk", 0, 0)
+
+	// 1) 遍历文件
+	candidates := make([]candidate, 0, 1024)
+	statuses := map[string]string{}
+	for _, folder := range folders {
+		if ctx.Err() != nil {
+			return ScanResult{}, ctx.Err()
+		}
+		files, status := walkFolder(folder.Path)
+		statuses[folder.ID] = status
+		candidates = append(candidates, files...)
+	}
+
+	// 2) 并发读取元数据
+	m.report("meta", 0, len(candidates))
+	results, cancelled := m.readAll(ctx, candidates, concurrency, force)
+	if cancelled {
+		// 被取消时 readAll 只能给出残缺的结果。**绝不能**拿它去覆盖 m.songs ——
+		// 那会把整个曲库清空，同时还发一条 scan:done（Kept=0）告诉前端「扫完了」。
+		// 保留旧曲库并如实返回错误，让上层决定要不要提示。
+		return ScanResult{}, scanCancelledErr(ctx)
+	}
+
+	// 3) 应用过滤规则并统计
+	cfg := m.store.Get()
+	res := filter.Apply(results, cfg.FilterRules)
+
+	// 3.5) 对 meta 没有解析器的容器（wma/ape/dsf…）用 ffmpeg 补时长。
+	//      时长缺失会让转码流拿不到 Content-Length，前端进度条就没法用。
+	m.enrichDurations(ctx, res.Kept, force)
+	if ctx.Err() != nil {
+		// 补时长阶段被取消：曲库本体不提交，宁可这次什么都没更新。
+		//
+		// 但**必须**把元数据缓存落一次盘：enrichDurations 探测过的文件在内存缓存里
+		// 已经被打上 Probed 标记（见那里的注释），而它只在 Scan 末尾的 SaveCache
+		// 才落盘。这里直接 return 的话那些标记全部丢失 —— 下次扫描会把同一批
+		// 「确实没有时长」的文件（wma/ape/dsf…）再起一遍 ffmpeg 子进程，
+		// 而 maxProbePerScan=48 正说明单次探测很贵。
+		// SaveCache 由 cacheIsUsable 保护，载入失败时它会自行拒绝写入。
+		_ = m.SaveCache()
+		return ScanResult{}, scanCancelledErr(ctx)
+	}
+
+	// 4) 与旧数据对比，得出新增/移除
+	m.mu.Lock()
+	prevIDs := make(map[string]bool, len(m.songs))
+	for id := range m.songs {
+		prevIDs[id] = true
+	}
+	newSongs := make(map[string]bootstrap.Song, len(res.Kept))
+	for _, s := range res.Kept {
+		newSongs[s.ID] = s
+	}
+	// ★ 读不全的文件夹不能拿「本次没找到」当「被删了」（第六轮审查 N-6）。
+	// 明细见 staleSongsForFailedFolders 的说明。
+	stale := staleSongsForFailedFolders(m.songs, newSongs, folders, statuses)
+	if len(stale) > 0 {
+		// 保留的旧条目也要按**当前**过滤规则再过一遍：用户完全可能在文件夹掉线
+		// 期间改了规则，曲库始终只应包含通过规则的歌（不能让绕开过滤的旧条目留下）。
+		stale = filter.Apply(stale, cfg.FilterRules).Kept
+	}
+	for _, s := range stale {
+		newSongs[s.ID] = s
+	}
+	added := 0
+	for id := range newSongs {
+		if !prevIDs[id] {
+			added++
+		}
+	}
+	removed := 0
+	for id := range prevIDs {
+		if _, ok := newSongs[id]; !ok {
+			removed++
+		}
+	}
+	m.songs = newSongs
+	m.markSongsDirtyLocked()
+
+	// 5) 更新文件夹状态与曲目数
+	//
+	// ★ 曲目数是 O(文件夹 × 曲库) 且**与 m.songs 无关**（只依赖本次扫描结果
+	//   res.Kept 和文件夹路径），所以在进锁之前先把 folderPaths 快照出来、
+	//   在锁外算完，锁内只做赋值 —— 这样这段二次循环不再拉长写锁持有时间。
+	//   原来它整个在 m.mu 里跑，10 万首 × 20 文件夹会让所有 Songs()/SongByID()
+	//   在这几毫秒里全部阻塞（RescanPaths 侧早已做了同类优化，见其注释）。
+	folderPaths := make([]string, len(m.folders))
+	for i := range m.folders {
+		folderPaths[i] = m.folders[i].Path
+	}
+	counts := countSongsInFolders(res.Kept, folderPaths)
+	// 读不全的文件夹：曲目数要把保留的旧条目一起算上，否则界面一边显示
+	// 「路径不存在 / 部分子目录读不到」，一边显示「0 首」，与曲库里实际留着的对不上。
+	// 只有真的出现读不全的文件夹时才有循环体（stale 为空则外层也空转）。
+	for i := range folderPaths {
+		for _, s := range stale {
+			if isUnder(s.Path, folderPaths[i]) {
+				counts[i]++
+			}
+		}
+	}
+	for i := range m.folders {
+		if status, ok := statuses[m.folders[i].ID]; ok {
+			m.folders[i].Status = status
+		}
+		m.folders[i].TrackCount = counts[i]
+	}
+	// ★ 只把「扫描得到的 status / trackCount」回填到配置里对应 id 的文件夹，
+	// **不要**整份覆盖 c.Folders。
+	//
+	// 为什么不能整份覆盖（以前正是 `c.Folders = foldersCopy`）：foldersCopy 是
+	// 扫描**开始时**的快照，而一次全量扫描可能跑几十秒到几分钟。这期间用户
+	// 新增或删除文件夹（AddFolder / RemoveFolder 会各自写一次配置）都会被这个
+	// 旧快照整体抹掉 —— 用户看到「刚加的文件夹自己消失了」，
+	// 而 m.folders 与 config.json 从此不一致（扫描根、界面列表各说各话）。
+	//
+	// 顺带解决「合成出来的下载目录」：它是从 DownloadDir 派生的，一旦落进
+	// config.Folders 就变成了"用户手动添加的文件夹"，改下载位置之后旧目录会
+	// 永远留在扫描根里，还会出现两条同 id 的记录。只回填已有条目的字段，
+	// 天然不会再把它写进配置。
+	type folderStat struct {
+		status string
+		count  int
+	}
+	stats := make(map[string]folderStat, len(m.folders))
+	for _, f := range m.folders {
+		if f.ID == bootstrap.DownloadFolderID {
+			continue
+		}
+		stats[f.ID] = folderStat{status: f.Status, count: f.TrackCount}
+	}
+	m.mu.Unlock()
+
+	_ = m.store.Update(func(c *bootstrap.Config) {
+		for i := range c.Folders {
+			st, ok := stats[c.Folders[i].ID]
+			if !ok {
+				continue // 扫描快照里没有它（扫描期间新加的）→ 原样保留
+			}
+			c.Folders[i].Status = st.status
+			c.Folders[i].TrackCount = st.count
+		}
+	})
+	_ = m.SaveCache()
+
+	out := ScanResult{
+		Found: res.Total,
+		// ★ Kept 用**扫描后曲库的实际大小**，而不是本次「找到并通过过滤」的条数。
+		// 正常路径下两者相等（每个通过过滤的条目都进了 newSongs）；只有文件夹
+		// 读不全时才会不同 —— 那时旧条目被保留着，报 res.Kept 会让界面弹出
+		//「扫描完成：保留 0 首」而曲库里有 2 首（第六轮审查 N-6）。
+		Kept:     len(newSongs),
+		Excluded: res.Excluded,
+		Added:    added,
+		Removed:  removed,
+		At:       time.Now().UnixMilli(),
+	}
+	m.notifyChanged(out)
+	return out, nil
+}
+
+// staleSongsForFailedFolders 返回「本次没找到、但因为所属文件夹读不全而不能
+// 当作已删除」的旧曲目。
+//
+// ★ 为什么需要它（第六轮审查 N-6）：
+// 全量扫描以前是拿本次结果**整体覆盖** `m.songs`（`m.songs = newSongs`）。
+// 可 `walkFolder` 在「网络盘掉线 / 目录被独占 / 权限被改」这类**瞬时**故障下
+// 会如实返回 denied / error / partial / missing —— 结果就是那一个文件夹的歌
+// 从曲库里消失：界面只多一个状态提示（「路径不存在」之类），歌已经没了，而且
+// 紧接着就被写进缓存；下次扫描成功之前，用户的歌单/收藏里那一批全是断链。
+//
+// 判据只有一条：**这个文件夹这次读全了吗**。没读全就没资格判定「谁被删了」，
+// 于是把那些文件夹下本次没找到的旧条目原样留着 —— 它们既不会被统计成
+// `Removed`，也不会从缓存里消失。
+//
+// 不会变成清不掉的幽灵：用户真的删掉文件夹时，走的是「从曲库移除文件夹」，
+// 那个路径不再是扫描根（`statuses` 里根本没有它），下次扫描照旧正常移除。
+func staleSongsForFailedFolders(
+	old, found map[string]bootstrap.Song,
+	folders []bootstrap.Folder,
+	statuses map[string]string,
+) []bootstrap.Song {
+	var untrusted []string
+	for _, f := range folders {
+		if status, ok := statuses[f.ID]; ok && status != statusOK {
+			untrusted = append(untrusted, f.Path)
+		}
+	}
+	if len(untrusted) == 0 {
+		return nil
+	}
+	var out []bootstrap.Song
+	for id, s := range old {
+		if _, ok := found[id]; ok {
+			continue // 这次也读到了：以新结果为准
+		}
+		for _, p := range untrusted {
+			if isUnder(s.Path, p) {
+				out = append(out, s)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// RescanPaths 只重新读取指定路径（文件夹监听触发的增量更新）。
+// 与全量扫描共用同一把「串行化」闸门，避免两者交叉覆盖 songs 表。
+func (m *Manager) RescanPaths(ctx context.Context, paths []string) (ScanResult, error) {
+	if len(paths) == 0 {
+		return ScanResult{}, nil
+	}
+	if err := m.beginScan(ctx); err != nil {
+		return ScanResult{}, err
+	}
+	defer m.endScan()
+	m.ensureCacheLoaded()
+
+	cfg := m.store.Get()
+
+	m.mu.RLock()
+	folders := append([]bootstrap.Folder(nil), m.folders...)
+	oldSongs := make(map[string]bootstrap.Song, len(m.songs))
+	for k, v := range m.songs {
+		oldSongs[k] = v
+	}
+	m.mu.RUnlock()
+
+	// 收集受影响的目录
+	dirs := map[string]bool{}
+	for _, p := range paths {
+		dirs[rescanDir(filepath.Dir(p), folders)] = true
+	}
+	candidates := []candidate{}
+	statuses := map[string]string{}
+	// ★ 读不全的目录（第六轮审查 N-6）：本次「没找到」不等于「被删了」。
+	// 记下来，下面替换旧条目时绕开它们 —— 否则网络盘掉一下就把那个目录的歌删干净
+	//（全量扫描侧同理，见 staleSongsForFailedFolders）。
+	untrusted := map[string]bool{}
+	for dir := range dirs {
+		files, status := walkFolder(dir)
+		candidates = append(candidates, files...)
+		if status != statusOK {
+			untrusted[dir] = true
+		}
+		for _, f := range folders {
+			if isUnder(dir, f.Path) {
+				statuses[f.ID] = status
+			}
+		}
+	}
+
+	results, cancelled := m.readAll(ctx, candidates, cfg.ScanConcurrency, false)
+	if cancelled {
+		// 同上：增量重扫会「先删受影响目录的旧条目再写入新结果」，
+		// 拿残缺结果往下走会直接把那个目录的歌全部删掉。
+		return ScanResult{}, scanCancelledErr(ctx)
+	}
+	res := filter.Apply(results, cfg.FilterRules)
+
+	m.mu.Lock()
+	// 先记下受影响目录里原本有哪些 id，用于统计「真正新增」
+	affectedBefore := map[string]bool{}
+	for id, s := range oldSongs {
+		for dir := range dirs {
+			if untrusted[dir] {
+				continue // 这个目录没读全：它下面的旧条目不能按「本次没找到」删掉
+			}
+			if isUnder(s.Path, dir) {
+				affectedBefore[id] = true
+				break
+			}
+		}
+	}
+	// 用新结果替换受影响目录下的旧条目
+	for id := range affectedBefore {
+		delete(m.songs, id)
+	}
+	added := 0
+	for _, s := range res.Kept {
+		if !affectedBefore[s.ID] {
+			added++
+		}
+		m.songs[s.ID] = s
+	}
+	m.markSongsDirtyLocked()
+	// 只重算**本次真的被影响到**的文件夹。
+	//
+	// 为什么不能整表重算：这里是 O(文件夹 × 全库曲目)，而且整段在写锁内。
+	// 本函数由文件夹监听触发（watcher.go#flush），也就是说「往音乐目录里丢一个
+	// 文件」就会引发一次全库 × 全文件夹的扫描 —— 实测 10 万首 × 20 个文件夹
+	// 单次约 10ms，期间所有 Songs() / SongByID() 全部阻塞。
+	//
+	// 增量重扫只会改动 dirs 之下的曲目，因此只有「与某个 affected dir 有包含
+	// 关系」的文件夹，其曲目数才可能变化；其余的沿用旧值即可。
+	// 实测同一场景：10.2ms → 0.58ms（约 17 倍），且持锁时间同比例缩短。
+	for i := range m.folders {
+		if status, ok := statuses[m.folders[i].ID]; ok {
+			m.folders[i].Status = status
+		}
+		touched := false
+		for dir := range dirs {
+			if isUnder(dir, m.folders[i].Path) {
+				touched = true
+				break
+			}
+		}
+		if !touched {
+			continue
+		}
+		count := 0
+		for _, s := range m.songs {
+			if isUnder(s.Path, m.folders[i].Path) {
+				count++
+			}
+		}
+		m.folders[i].TrackCount = count
+	}
+	m.mu.Unlock()
+
+	out := ScanResult{
+		Found:    res.Total,
+		Kept:     len(res.Kept),
+		Excluded: res.Excluded,
+		Added:    added,
+		At:       time.Now().UnixMilli(),
+	}
+	m.notifyChanged(out)
+	return out, nil
+}
+
+// readAll 并发读取元数据。
+//
+// 第二个返回值 cancelled=true 表示「被 ctx 取消了，结果不完整」——调用方必须
+// 据此放弃本次结果，绝不能当成「这些就是全部歌曲」。之前只返回切片，取消时返回
+// out[:0]（非 nil 的空切片），调用方无法区分「取消」与「真的没有歌」，
+// 于是把整个曲库覆盖成了空。
+func (m *Manager) readAll(ctx context.Context, items []candidate, concurrency int, force bool) ([]bootstrap.Song, bool) {
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	type job struct {
+		idx int
+		c   candidate
+	}
+	jobs := make(chan job)
+	out := make([]bootstrap.Song, len(items))
+	var wg sync.WaitGroup
+	var done int64
+	var cancelled atomic.Bool
+	var mu sync.Mutex
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if ctx.Err() != nil {
+					// 注意：worker 提前退出会留下零值空槽，所以这里必须
+					// 显式记下「取消」，不能只靠 ctx.Err() 事后判断
+					//（发送循环可能刚好在所有 job 发完之后 ctx 才被取消）。
+					cancelled.Store(true)
+					return
+				}
+				out[j.idx] = m.parseOne(j.c, force)
+				mu.Lock()
+				done++
+				n := int(done)
+				mu.Unlock()
+				if n%40 == 0 {
+					m.report("meta", n, len(items))
+				}
+			}
+		}()
+	}
+
+	for i, c := range items {
+		select {
+		case jobs <- job{idx: i, c: c}:
+		case <-ctx.Done():
+			cancelled.Store(true)
+			close(jobs)
+			wg.Wait()
+			return nil, true
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if cancelled.Load() || ctx.Err() != nil {
+		return nil, true
+	}
+	m.report("meta", len(items), len(items))
+
+	// 丢掉空槽（防御性：正常情况下不应该有）
+	final := make([]bootstrap.Song, 0, len(out))
+	for _, s := range out {
+		if s.ID != "" {
+			final = append(final, s)
+		}
+	}
+	return final, false
+}
+
+// parseOne 解析单个候选文件的元数据，并保证「单个畸形文件不会终止进程」。
+//
+// ★ 为什么必须在这里兜住 panic：meta.Read 面对畸形 / 极端文件时可能 panic
+// （历史故障：时长不足 1 秒的文件在 meta 里触发整数除零）。readAll 的 worker
+// 此前没有任何 recover，panic 会一路冒到 runtime，**整个应用直接退出** ——
+// 用户看到的现象是「扫描到某个文件就闪退」，且重启后再次闪退。
+//
+// 兜底语义与「文件读不出标签」完全一致：这首歌照样保留（路径 / 大小 / 修改时间
+// 都在，只是标题回落到文件名、时长与码率为 0），并留一条日志便于定位。
+func (m *Manager) parseOne(c candidate, force bool) bootstrap.Song {
+	return safeParse(c, func() bootstrap.Song { return m.songFromCandidate(c, force) })
+}
+
+// safeParse 执行一次元数据解析，把 panic 降级成「无标签」的兜底结果。
+//
+// 单独抽成函数是为了让这条兜底路径**本身可测**：测试可以直接传一个 panic 的
+// 闭包，不必伪造一个能真的让解析器崩溃的音频文件（那种文件本来就该被修掉）。
+func safeParse(c candidate, fn func() bootstrap.Song) (song bootstrap.Song) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[library] 解析元数据 panic，已降级为「无标签」（%s）: %v", c.path, r)
+			song = bootstrap.Song{
+				ID:      bootstrap.StableID(c.path, "t"),
+				Path:    c.path,
+				Ext:     c.ext,
+				Size:    c.size,
+				ModTime: c.mod,
+				AddedAt: c.mod,
+			}
+			fillFallback(&song)
+		}
+	}()
+	return fn()
+}
+
+func (m *Manager) songFromCandidate(c candidate, force bool) bootstrap.Song {
+	id := bootstrap.StableID(c.path, "t")
+	song := bootstrap.Song{
+		ID:      id,
+		Path:    c.path,
+		Ext:     c.ext,
+		Size:    c.size,
+		ModTime: c.mod,
+	}
+
+	// 命中缓存则直接复用（同一文件重扫几乎零成本）。
+	//
+	// 复用前要确认「缓存里记的那张封面文件还在」：封面是内容寻址的独立文件，
+	// 换过缓存目录、清理过缓存、或者把数据目录拷到另一台机器之后，索引还在
+	// 但文件已经没了 —— 此时若照旧复用，coverUrl 会指向一个 404 的名字，
+	// 用户看到的就是「这首歌有内嵌封面却只显示默认图」。封面缺失时退回完整
+	// 读取一次（标签解析很便宜，封面会被重新 Put 回当前目录，自动自愈）。
+	if !force {
+		m.cacheMu.RLock()
+		entry, ok := m.cache[c.path]
+		m.cacheMu.RUnlock()
+		if ok && entry.Size == c.size && entry.ModTime == c.mod && m.coverAvailable(entry.CoverFile) {
+			song.Title = entry.Title
+			song.Artist = entry.Artist
+			song.Album = entry.Album
+			song.Duration = entry.Duration
+			song.SampleRate = entry.Sample
+			song.Bitrate = entry.Bitrate
+			song.CoverURL = m.covers.URL(entry.CoverFile)
+			song.AddedAt = c.mod
+			fillFallback(&song)
+			return song
+		}
+	}
+
+	info := meta.Read(c.path)
+	song.Title = info.Title
+	song.Artist = info.Artist
+	song.Album = info.Album
+	song.Duration = info.DurationMS
+	song.SampleRate = info.SampleRate
+	song.Bitrate = info.Bitrate
+	song.AddedAt = c.mod
+	fillFallback(&song)
+
+	// 封面字节写进内容寻址的封面缓存目录，元数据里只留文件名。
+	// 同内容（整张专辑共用一张封面）只写一次盘。
+	coverFile, err := m.covers.Put(info.CoverData, info.CoverMIME)
+	if err != nil {
+		// 封面存不下不该让整首歌的元数据也失败：降级成「无封面」并记一条日志
+		log.Printf("[library] 写入封面缓存失败（%s）: %v", c.path, err)
+	} else if coverFile != "" {
+		song.CoverURL = m.covers.URL(coverFile)
+	}
+
+	m.cacheMu.Lock()
+	m.cache[c.path] = cacheEntry{
+		Title:     song.Title,
+		Artist:    song.Artist,
+		Album:     song.Album,
+		Duration:  song.Duration,
+		Sample:    song.SampleRate,
+		Bitrate:   song.Bitrate,
+		CoverFile: coverFile,
+		ModTime:   c.mod,
+		Size:      c.size,
+	}
+	m.cacheMu.Unlock()
+	atomic.AddInt64(&m.metaReads, 1)
+	return song
+}
+
+// coverAvailable 判断元数据缓存里记的封面文件名是否仍然可用。
+// 空文件名 = 「这首歌本来就没有内嵌封面」，属于可用（不需要重新解析）。
+func (m *Manager) coverAvailable(name string) bool {
+	if name == "" {
+		return true
+	}
+	return m.covers.Exists(name)
+}
+
+// fillFallback 元数据缺失时的兜底：用文件名当标题，未知歌手/专辑
+func fillFallback(s *bootstrap.Song) {
+	if strings.TrimSpace(s.Title) == "" {
+		base := filepath.Base(s.Path)
+		s.Title = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	if strings.TrimSpace(s.Artist) == "" {
+		s.Artist = "未知歌手"
+	}
+	if strings.TrimSpace(s.Album) == "" {
+		s.Album = "未知专辑"
+	}
+}
+
+/* --------------------------------------------------------------------------
+   无时长文件的兜底探测
+   --------------------------------------------------------------------------
+   meta 包只手写了 mp3/flac/wav/m4a 的时长解析。wma/ape/dsf/ogg 等容器
+   没有解析器，时长会是 0 —— 会导致转码流拿不到 Content-Length，
+   前端连进度条都用不了。这里对这类文件用 ffmpeg 探测一次并写入缓存。
+   -------------------------------------------------------------------------- */
+
+// maxProbePerScan 单次扫描最多探测多少个文件，避免首次扫描被大量进程拖住；
+// 剩下的会在后续扫描里陆续补齐（结果有缓存，不会重复探测）。
+const maxProbePerScan = 48
+
+func (m *Manager) enrichDurations(ctx context.Context, songs []bootstrap.Song, force bool) int {
+	tools := ffmpeg.Resolve()
+	if !tools.Available() {
+		return 0
+	}
+
+	// 收集候选：时长为 0 且缓存里没有「已探测过」标记
+	type task struct {
+		idx int
+		s   bootstrap.Song
+	}
+	tasks := make([]task, 0, len(songs))
+	for i, s := range songs {
+		if s.Duration > 0 {
+			continue
+		}
+		if !force {
+			m.cacheMu.RLock()
+			entry, ok := m.cache[s.Path]
+			m.cacheMu.RUnlock()
+			if ok && entry.Probed && entry.Size == s.Size && entry.ModTime == s.ModTime {
+				continue // 已经探测过且确实没有时长，不再重复
+			}
+		}
+		tasks = append(tasks, task{idx: i, s: s})
+		if len(tasks) >= maxProbePerScan {
+			break
+		}
+	}
+	if len(tasks) == 0 {
+		return 0
+	}
+
+	m.report("probe", 0, len(tasks))
+	sem := make(chan struct{}, 2) // ffmpeg 进程较重，并发压到 2
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var done, filled int
+
+	for _, t := range tasks {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(t task) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			info, err := ffmpeg.Probe(pctx, tools.FFmpeg, t.s.Path)
+			cancel()
+
+			mu.Lock()
+			done++
+			n := done
+			if err == nil && info.DurationSec > 0 {
+				songs[t.idx].Duration = int64(info.DurationSec * 1000)
+				if songs[t.idx].SampleRate == 0 {
+					songs[t.idx].SampleRate = info.SampleRate
+				}
+				if songs[t.idx].Bitrate == 0 {
+					songs[t.idx].Bitrate = info.Bitrate
+				}
+				filled++
+			}
+			mu.Unlock()
+
+			// 写回缓存：拿到时长的存时长，没拿到的存 Probed 标记
+			m.cacheMu.Lock()
+			entry := m.cache[t.s.Path]
+			entry.Title = songs[t.idx].Title
+			entry.Artist = songs[t.idx].Artist
+			entry.Album = songs[t.idx].Album
+			entry.Size = t.s.Size
+			entry.ModTime = t.s.ModTime
+			entry.Probed = true
+			if err == nil && info.DurationSec > 0 {
+				entry.Duration = int64(info.DurationSec * 1000)
+				entry.Sample = info.SampleRate
+				entry.Bitrate = info.Bitrate
+			}
+			m.cache[t.s.Path] = entry
+			m.cacheMu.Unlock()
+
+			if n%4 == 0 {
+				m.report("probe", n, len(tasks))
+			}
+		}(t)
+	}
+	wg.Wait()
+	m.report("probe", len(tasks), len(tasks))
+	return filled
+}
+
+/* --------------------------------------------------------------------------
+   目录遍历
+   -------------------------------------------------------------------------- */
+
+// 遍历状态。**对外契约**：前端文件夹卡片按这些值出提示
+// （`frontend/src/js/ui/settings-view.js#foldersCard`），改字面量要同时改前端；
+// 前端有一条测试逐个比对两边（`frontend/tests/folder-status.test.js`）。
+const (
+	// statusOK 正常遍历完毕
+	statusOK = "ok"
+	// statusMissing 扫描根不存在（或不是一个目录）
+	statusMissing = "missing"
+	// statusDenied 扫描根不可读（无权限）
+	statusDenied = "denied"
+	// statusError 扫描根遇到其他 I/O 错误（磁盘错、路径过长、网络盘断开…）
+	statusError = "error"
+	// statusPartial 扫描根本身能读，但有子目录没读成 —— 结果可能不完整
+	statusPartial = "partial"
+)
+
+// entryIsDir 判断一个目录项是不是目录 —— **对链接会解引用**。
+//
+// ★ 这就是「junction 根静默 0 首」的修复点。`fs.DirEntry.IsDir()` 看的是
+// **Lstat** 得到的型别，而 Windows 上 junction（目录联接）的型别是
+// `ModeIrregular`：既不是 `ModeDir` 也不是 regular。于是「链接指向一个目录」
+// 在旧实现里被当成「既不是目录、也不是音频文件」直接跳过：
+// 实测（`mklink /J`，见 walk_folder_junction_windows_test.go）把 junction
+// 当作扫描根，结果是 **0 首 + 状态 ok** —— 界面只显示「这个文件夹一首歌都没有」，
+// 不报任何错，用户完全无从下手；更糟的是 RescanPaths 会拿这份空结果去
+// **删掉**该目录下原有的条目。
+//
+// 普通目录仍然走零开销的 `IsDir()`；只有非普通项才多一次 `os.Stat`。
+func entryIsDir(path string, e fs.DirEntry) bool {
+	if e.IsDir() {
+		return true
+	}
+	if e.Type().IsRegular() {
+		return false
+	}
+	st, err := os.Stat(path) // 跟随链接：junction / 符号链接在这里才显出是目录
+	if err != nil {
+		return false // 坏链接（目标不存在）：当作不存在
+	}
+	return st.IsDir()
+}
+
+// linkLoopsBack 判断一个（可能是链接的）目录会不会绕回自己的祖先。
+//
+// 为什么必须有：junction 可以指向自己的祖先（包括扫描根自己）。旧实现里
+// 这种链接被 `IsDir()` 挡掉了，所以「无害地漏掉」；一旦我们开始解引用，
+// 它就会变成**无限递归** —— 扫描线程再也回不来。判据是把「自己解引用后的
+// 身份」与路径上每个祖先目录逐级比较：相等即说明它是环。
+//
+// 用 os.SameFile 而不是比字符串：junction 的目标可以写成相对路径、8.3 短名、
+// 大小写不同、带 `\\?\` 前缀，字符串比较会被这些写法绕过去，而身份比较不会
+// （实测 `os.SameFile(junction, 目标)` 为 true）。
+//
+// 只有非普通项目才做这件事（普通目录构成树，不可能有环），代价可以忽略。
+func linkLoopsBack(path string, e fs.DirEntry) bool {
+	if e.IsDir() {
+		return false
+	}
+	self, err := os.Stat(path)
+	if err != nil || !self.IsDir() {
+		return false
+	}
+	// 逐级往上：每一级都与「自己解引用后的身份」比一次。
+	//
+	// ★ 终止条件必须是「filepath.Dir 到达不动点」（Windows 上是 `C:\`、
+	// Unix 上是 `/`），不能写成 `len(p) < len(path)` —— path 是**最初**那个
+	// 链接路径，走到根之后它的长度依然小于 path，循环就再也出不来
+	//（实测把 os.Stat(`C:\`) 打成了死循环，junction 用例直接挂到测试超时）。
+	for p := filepath.Dir(path); ; {
+		if anc, err := os.Stat(p); err == nil && os.SameFile(self, anc) {
+			log.Printf("[library] 跳过会绕回自身的目录链接 %s（它指向的正是祖先 %s）", path, p)
+			return true
+		}
+		next := filepath.Dir(p)
+		if next == p {
+			break
+		}
+		p = next
+	}
+	return false
+}
+
+// resolveLinkTarget 解析一个目录链接 / 联接（junction）的目标，返回规范化的绝对路径。
+//
+// 解析不出来（不是链接、坏链接、或拿到的是没法归一化的形态）返回 ""，
+// 调用方一律按「它不是指向别处的链接」处理 —— 跟随它，与修复前行为一致。
+//
+// ★ 实测（探针见 walk_folder_junction_windows_test.go 的文件头）：
+// `os.Readlink(junction)` **能**返回目标的普通绝对路径（`C:\…\Music\A`），
+// 而 `filepath.EvalSymlinks(junction)` 是把链接路径原样返回（不解析）。
+// 也就是说「链接目标是否落在扫描根内部」这件事是可以做的，不必去调
+// GetFinalPathNameByHandle（第六轮审查 N-5 的说明里以为必须走那条路）。
+func resolveLinkTarget(path string) string {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return ""
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+	// 不同 Windows 版本 / Go 版本可能给出 NT 对象路径形态（`\??\C:\…`）
+	// 或扩展长度路径（`\\?\C:\…`）：去掉前缀再归一化。
+	for _, prefix := range []string{`\??\`, `\\?\`, `//?/`} {
+		if strings.HasPrefix(target, prefix) {
+			target = target[len(prefix):]
+			break
+		}
+	}
+	if !filepath.IsAbs(target) {
+		// 相对目标是合法的（junction 可以存相对路径），按「相对链接所在目录」解释
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(abs)
+}
+
+// linkTargetsInside 判断链接目标是否落在 root（含根本身）内部。
+//
+// 两侧都先折叠大小写（Windows）再用 isUnder：junction 目标回来的大小写
+// 常与扫描根原文不同，字符串比较会把同一个目录判成两个。
+func linkTargetsInside(root, target string) bool {
+	if root == "" || target == "" {
+		return false
+	}
+	return isUnder(foldPath(target), foldPath(root))
+}
+
+// rescanDir 把「事件所在的目录」规范化：路径里有哪一层是**指向某个扫描根内部**
+// 的目录链接，就用链接目标替换那一层再扫。
+//
+// ★ 为什么增量重扫也必须做这件事（第六轮审查 N-5）：
+// 监听按**文件路径**入队（watcher.go#handle），而增量重扫扫的是「文件所在目录」
+// 而不是整个扫描根 —— 那是刻意的性能取舍（见 RescanPaths 里那段说明：整个根 ×
+// 全库是 O(文件夹 × 曲目)，且整段在写锁内）。若那个目录是从一个树内链接走下来的
+// （事件名带着链接路径，例如 `root\linkA\sub\x.mp3`），扫出来的歌就会带着链接
+// 路径再进库一次 —— 与 walkFolder 跳过树内链接是同一条不变量，只是入口不同。
+//
+// 逐层往上找第一层「链接且目标在扫描根内部」；没找到就原样返回。
+func rescanDir(dir string, folders []bootstrap.Folder) string {
+	for p := dir; ; {
+		if target := resolveLinkTarget(p); target != "" && targetInsideFolders(target, folders) {
+			rest, err := filepath.Rel(p, dir)
+			if err == nil && rest != "." && rest != "" {
+				return filepath.Join(target, rest) // 事件在链接的下一层子目录里
+			}
+			return target
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return dir
+		}
+		p = parent
+	}
+}
+
+// targetInsideFolders 判断一个（链接解析出来的）路径是否落在任何扫描根之下。
+// 扫描根自己也可能是链接，因此两侧都试：原文与解引用后的位置。
+func targetInsideFolders(target string, folders []bootstrap.Folder) bool {
+	folded := foldPath(target)
+	for _, f := range folders {
+		if isUnder(folded, foldPath(f.Path)) {
+			return true
+		}
+		if root := resolveLinkTarget(f.Path); root != "" && isUnder(folded, foldPath(root)) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipLinkReason 判断这个目录链接该不该跟随：目标落在**本次扫描根内部**时返回
+// 原因（空字符串表示可以跟随）。
+//
+// ★ 为什么必须跳过（第六轮审查 N-5）：`root\A` 与 `root\linkA → root\A` 并存时，
+// 目标自己会被正常走到，跟着链接再走一遍就**把同一批歌以两个路径各进库一次** ——
+// 同一首歌两条记录，路径不同、StableID 也不同（歌单/收藏里看着像两首）。
+//
+// 判据是「目标是否在扫描根之下」，因此与遍历顺序**无关**：无论链接先被读到还是
+// 后被读到，歌都记在真实目录那条路径上（顺序相关的那种「按目录身份去重」会
+// 取决于谁先被读到 —— 链接先读到就把歌记到链接路径上，链接删了歌就没了）。
+//
+// 指到扫描根**之外**的链接仍然跟随：那是把别的盘/别的目录并进曲库的正常用法
+// （第 7 条修复刻意支持的场景，见 TestWalkFolderJunctionSubdirIsTraversed）。
+func (w *folderWalker) skipLinkReason(path string, e fs.DirEntry) string {
+	if e.IsDir() {
+		return "" // 普通目录不可能指向别处
+	}
+	target := resolveLinkTarget(path)
+	if target == "" {
+		return "" // 不是链接 / 解析不出来：按修复前的行为跟随
+	}
+	if linkTargetsInside(w.root, target) || linkTargetsInside(w.rootAlso, target) {
+		return fmt.Sprintf("它的目标 %s 落在本扫描根内部（%s），跟随它会让同一批歌以两个路径各进库一次",
+			target, w.root)
+	}
+	return ""
+}
+
+// folderWalker 一次扫描根的遍历器。
+//
+// ★ 为什么不用 filepath.WalkDir：它按 Lstat 的型别决定要不要下钻，看不到
+// junction 后面的目录（见 entryIsDir 的说明）。手写递归之后还能顺带做到两件
+// WalkDir 做不到的事：
+//  1. 用祖先链身份比较剪掉会绕回自身的链接（否则解引用之后就是无限递归）；
+//  2. 精确区分「扫描根本身读失败」（状态要报给用户）与「某个子目录读失败」
+//     （跳过它、状态降级为 partial），而不是把两者一起吞成 ok。
+type folderWalker struct {
+	root string
+	// rootAlso 是扫描根**解引用之后**的位置（根自己就是链接时才有值，否则为 ""）。
+	// 用于「根是链接」时判断树内链接：`root\link → 目标\A` 的 `目标\A` 不在
+	// root 的字面前缀下，却是根内部的东西。
+	rootAlso string
+	out      []candidate
+	// partial 表示有子目录没读成：本次结果可能不完整，状态要降级成 partial。
+	// 定义收紧到「目录读不了」这一件事 —— 坏链接（目标不存在）只记日志，
+	// 它不是一个「读不了的目录」。
+	partial bool
+	// readDir 是目录枚举实现。生产路径就是 os.ReadDir；测试注入一个会失败的
+	// 实现，才能在没有权限/ACL 的机器上确定性地覆盖 denied / error / partial
+	// 三条分支（见 walk_folder_test.go）。
+	readDir func(string) ([]fs.DirEntry, error)
+}
+
+// walk 递归收集 dir 下的音频文件。返回非 nil 错误只代表**扫描根本身**读失败。
+func (w *folderWalker) walk(dir string) error {
+	readDir := w.readDir
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	entries, err := readDir(dir)
+	if err != nil {
+		if dir == w.root {
+			return err // 根本身读不了 = 整次遍历失败，由调用方映射成状态
+		}
+		w.partial = true
+		log.Printf("[library] 跳过读不了的子目录 %s: %v", dir, err)
+		return nil
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if entryIsDir(path, e) {
+			// 跳过隐藏目录（.git / $RECYCLE.BIN 等）；根自己不算
+			name := e.Name()
+			if path != w.root && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "$")) {
+				continue
+			}
+			if linkLoopsBack(path, e) {
+				continue
+			}
+			if reason := w.skipLinkReason(path, e); reason != "" {
+				log.Printf("[library] 跳过目录链接 %s：%s", path, reason)
+				continue
+			}
+			if err := w.walk(path); err != nil {
+				return err
+			}
+			continue
+		}
+		// 只收普通文件。`!IsRegular()` 的同义词是「目录、链接、设备…」，
+		// 走到这里说明它连解引用都不是目录：坏链接或特殊文件，记一行就好。
+		if !e.Type().IsRegular() {
+			log.Printf("[library] 跳过不是普通文件的目录项 %s（型别 %v）", path, e.Type())
+			continue
+		}
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+		if !bootstrap.IsAudioExt(ext) {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		w.out = append(w.out, candidate{
+			path:   path,
+			size:   fi.Size(),
+			ext:    ext,
+			folder: w.root,
+			mod:    fi.ModTime().UnixMilli(),
+		})
+	}
+	return nil
+}
+
+func walkFolder(root string) ([]candidate, string) {
+	return walkFolderWith(root, os.ReadDir)
+}
+
+// walkFolderWith 与 walkFolder 相同，只是目录枚举实现可注入（测试用）。
+func walkFolderWith(root string, readDir func(string) ([]fs.DirEntry, error)) ([]candidate, string) {
+	out := []candidate{}
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, statusMissing
+		}
+		if os.IsPermission(err) {
+			return out, statusDenied
+		}
+		log.Printf("[library] 扫描根不可访问 %s: %v", root, err)
+		return out, statusError
+	}
+	if !info.IsDir() {
+		return out, statusMissing
+	}
+
+	w := &folderWalker{root: root, rootAlso: resolveLinkTarget(root), out: out, readDir: readDir}
+	if err := w.walk(root); err != nil {
+		if os.IsPermission(err) {
+			return w.out, statusDenied
+		}
+		// 以前这里返回 "ok"：磁盘 I/O 错误 / 路径过长 / 网络盘断开都会被当成
+		// 「扫描成功」，曲库被静默截断而界面上没有任何提示，排查极其困难。
+		log.Printf("[library] 遍历 %s 失败: %v", root, err)
+		return w.out, statusError
+	}
+	if w.partial {
+		return w.out, statusPartial
+	}
+	return w.out, statusOK
+}
+
+// countSongsInFolders 统计每个文件夹下有多少首（返回的切片与 paths 等长）。
+//
+// 抽成独立函数有两个目的：
+//  1. 让调用方能在**写锁之外**先算好（见 Scan 第 5 步的说明）—— 这段是
+//     O(文件夹 × 曲库)，不该在锁里跑；
+//  2. 语义集中一处，便于测试（嵌套文件夹时一首歌会被多个文件夹同时计入，
+//     与原来的 `isUnder` 循环逐字一致）。
+func countSongsInFolders(songs []bootstrap.Song, paths []string) []int {
+	counts := make([]int, len(paths))
+	for i, root := range paths {
+		n := 0
+		for _, s := range songs {
+			if isUnder(s.Path, root) {
+				n++
+			}
+		}
+		counts[i] = n
+	}
+	return counts
+}
+
+// isUnder 判断 path 是否位于 root 之下（含 root 本身）
+func isUnder(path, root string) bool {
+	// 快速路径：root 是 path 的字符串前缀，且边界落在目录分隔符上。
+	//
+	// 为什么需要它：这个函数在 Scan / RescanPaths 里被调用 O(folders × songs) 次
+	//（20 个文件夹 × 10 万首 = 200 万次），且整段在写锁内完成。filepath.Rel 会做
+	// Clean/Abs 与字符串分配，是那条循环的主要成本。
+	//
+	// 快路径成立的前提在扫描路径上是硬保证的：song.Path 来自
+	// filepath.WalkDir(folder.Path)，必然以 folder.Path 的原文开头。
+	// 快路径不成立时（大小写不同、相对路径、含 . 或 ..）落到下面的慢路径，
+	// 语义与原实现完全一致。
+	if root != "" && strings.HasPrefix(path, root) {
+		if len(path) == len(root) {
+			return true
+		}
+		if isSep(root[len(root)-1]) || isSep(path[len(root)]) {
+			return true
+		}
+	}
+
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	// 不能写成 !strings.HasPrefix(rel, "..")：filepath.Rel("C:/Music",
+	// "C:/Music/..hidden/a.mp3") 得到 "..hidden/a.mp3"，它同样以 ".." 开头，
+	// 于是**真实存在的子目录**会被判成「不在 root 之下」。
+	// 只有恰好等于 ".." 或以 ".." + 分隔符开头才是真的越界。
+	if rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// isSep 判目录分隔符（Windows 上两种都认，便于比较外部传入的路径字符串）
+func isSep(c byte) bool {
+	return c == filepath.Separator || c == '/' || c == '\\'
+}
+
+// CountInFolder 统计某目录下的曲目数（供文件夹新增后立即回显）
+func (m *Manager) CountInFolder(root string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	n := 0
+	for _, s := range m.songs {
+		if isUnder(s.Path, root) {
+			n++
+		}
+	}
+	return n
+}
+
+// ValidateFolder 新增目录前的校验
+func ValidateFolder(path string) (string, error) {
+	p := bootstrap.ExpandPath(path)
+	if p == "" {
+		return "", errors.New("路径不能为空")
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return "", fmt.Errorf("路径不存在或无法访问: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("请选择一个文件夹，而不是文件")
+	}
+	return p, nil
+}

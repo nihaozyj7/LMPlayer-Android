@@ -1,0 +1,84 @@
+/* ==========================================================================
+   示例样式 — 外观（契约 v3）
+   --------------------------------------------------------------------------
+   ★ 不用自己写作用域前缀了：宿主会把这份 CSS 包成
+
+        @layer skin {
+          @scope (.playerview[data-skin="<你的样式 id>"],
+                  .skin-bg[data-skin="<你的样式 id>"]) { …你的 CSS… }
+        }
+
+     也就是说：
+       · 你写不到标题栏 / 底栏 / 播放队列等宿主 UI（写了也不生效）；
+       · 也不会污染别的界面，不需要每行都加 `.playerview[data-skin=…]`；
+       · `@layer skin` 在宿主壳的层之下，覆盖不了宿主控件 —— 那本来就不该你管，
+         宿主会用清单里的 colors 决定自己的配色并保证可读。
+
+   可以随便用的 CSS 变量（由应用主题提供，深浅色会自动跟随）：
+     --accent           强调色          --text-1 / --text-2 / --text-3  文字层级
+     --surface-1 / --surface-2        卡片底色
+     --glass-bg / --glass-blur        毛玻璃
+     --lyric-size / --lyric-pad       歌词字号 / 居中留白
+
+   ★ `--lyric-size` 是**用户设置**（设置 → 歌词字号），宿主写在 :root 上，
+     用 `ctx.sdk.createLyricsView` 画的歌词已经读它。**不要为了"固定一个好看的
+     字号"在本样式里写死它** —— 那等于替用户关掉了这个设置（改字号会没反应）。
+     想让歌词比用户的设置更大/更小，或者只调当前行与压暗程度，请写
+     `--lyric-size-active` / `--lyric-dim`（见《皮肤说明.md》「歌词零件的旋钮」）。
+
+   想给"自己这块"定一个底色，直接写在这里即可（清单里的 colors.bg 只是给宿主
+   判断它的控件栏该用深色还是浅色，不是给你的画面上色）。
+
+   ★ 声明 capabilities.background: true 之后，舞台会变成**铺满整窗**（inset: 0），
+     而宿主的「标题栏 + 头部行」与「底部播放控件栏」会**压在你的画面上**。
+     这两条带子的高度由宿主写成 --skin-inset-top / --skin-inset-bottom，任何
+     要给人读的文字都要让开它们，例如：
+
+       padding: calc(var(--skin-inset-top, 0px) + 20px) 26px
+                calc(var(--skin-inset-bottom, 0px) + 18px);
+
+     装饰层（背景 / 渐变 / 粒子）可以画到带子底下去，文字不行；兜底值必须写 0px
+     （桌面背景歌词窗口没有这两块 chrome）。详见《皮肤说明.md》的「安全区」。
+   ========================================================================== */
+
+.demo {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+  padding: 24px;
+  box-sizing: border-box;
+}
+
+.demo__cover {
+  width: 220px;
+  height: 220px;
+  border-radius: 12px;
+  object-fit: cover;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 35%);
+}
+
+.demo__title {
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.demo__sub {
+  color: var(--text-2);
+}
+
+/* 歌词区由 ctx.sdk.createLyricsView 生成（.lyrics / .lyrics__scroll / .lyric），
+   这里只调它的排版参数，不用自己写滚动逻辑。
+
+   ★ 如果你的歌词区**又矮又宽**（比如只有舞台高的两三成），必须自己重设
+     `--lyric-pad`：宿主给的是 34%，而 CSS 的百分比内边距是相对**宽度**解析的，
+     纸面上它比你的容器还高 —— border-box 下浏览器会把滚动容器撑到「内边距之和」，
+     SDK 按 clientHeight 居中当前行时就会把当前句放到可见带之外（表现是
+     「歌词不会自己滚」）。按高度给一个「半个歌词带」的值即可，例如
+     `--lyric-pad: calc(var(--你的舞台高, 720px) * 0.135)`（变量写在
+     `.lyrics__scroll` 上才压得过宿主那份未分层的规则）。 */
+.pv-lyrics-host {
+  flex: 1 1 auto;
+  min-height: 0;
+}

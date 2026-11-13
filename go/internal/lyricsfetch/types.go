@@ -1,0 +1,799 @@
+// Package lyricsfetch 负责在线歌词搜索与匹配。
+//
+// 设计上参考 LDDC 的多源歌词搜索思路：LRCLIB、网易云、QQ 音乐、酷狗各自实现
+// Provider，由 Aggregator 并发查询、按标题/歌手/时长打分，再按得分顺序抓取歌词。
+package lyricsfetch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"localmusicplayer/internal/lyrics"
+)
+
+// ErrNoMatch 表示没有找到足够可信的歌词。
+var ErrNoMatch = errors.New("没有找到匹配的歌词")
+
+// SearchRequest 描述一首待匹配歌曲。
+type SearchRequest struct {
+	Title    string
+	Artist   string
+	Album    string
+	Duration int64 // 毫秒
+	Keyword  string
+	Limit    int
+}
+
+// Candidate 是一条歌词搜索结果。
+type Candidate struct {
+	ID        string `json:"id"`
+	Provider  string `json:"provider"`
+	Title     string `json:"title"`
+	Artist    string `json:"artist"`
+	Album     string `json:"album"`
+	Duration  int64  `json:"duration"` // 毫秒
+	Cover     string `json:"cover"`
+	HasLyrics bool   `json:"hasLyrics"`
+	Score     int    `json:"score"`
+
+	raw any
+}
+
+// Key 返回跨来源唯一的候选键。
+func (c Candidate) Key() string { return c.Provider + ":" + c.ID }
+
+// Result 是抓取到的歌词。
+type Result struct {
+	LRC         string    `json:"lrc"`
+	Translation string    `json:"translation,omitempty"`
+	Romanized   string    `json:"romanized,omitempty"`
+	Provider    string    `json:"provider"`
+	Source      string    `json:"source"`
+	Candidate   Candidate `json:"candidate"`
+}
+
+// LyricFormat 歌词的精细度。
+//
+//   - 字级（FormatWord）：带逐字时间轴，增强 LRC / QRC / KRC / YRC 都算 ——
+//     判据统一用 lyrics.HasWordTiming（它认这几种写法）；
+//   - 行级（FormatLine）：只有整行时间轴，逐字高亮没得点。
+type LyricFormat string
+
+const (
+	FormatWord LyricFormat = "word"
+	FormatLine LyricFormat = "line"
+)
+
+// FormatOf 判断一段歌词文本是字级还是行级。
+//
+// 歌词搜索界面用它给每个候选打「逐字 / 逐行」的标：抓取之前无从知道格式，
+// 抓一次是最直接的答案（见 OnlineService.ProbeLyricsFormat）。
+func FormatOf(text string) LyricFormat {
+	if lyrics.HasWordTiming(text) {
+		return FormatWord
+	}
+	return FormatLine
+}
+
+// Provider 是单个歌词源。
+type Provider interface {
+	Name() string
+	Search(ctx context.Context, req SearchRequest) ([]Candidate, error)
+	Fetch(ctx context.Context, candidate Candidate) (Result, error)
+}
+
+// WordProvider 是 Provider 的**可选**能力：这个来源可能给出字级（逐字）歌词。
+//
+// 声明它的用处只有一个，但很关键：抓取之前无从知道某个候选是字级还是行级，
+// 而「有逐字就播逐字」要求自动匹配在拿到行级结果之后，还愿意为**可能给字级**
+// 的来源多花一次请求（见 Match）。没有这个声明，一个稳定但只能给行级的来源
+// 会永远压住有逐字的那个来源。
+type WordProvider interface {
+	// HasWordLevel 该来源是否可能返回带逐字时间轴的歌词。
+	HasWordLevel() bool
+}
+
+// WordLevelToggle 是 Provider 的**可选**能力：运行时关掉「字级歌词」这条路。
+//
+// 存在的理由：字级歌词只有 QQ 音乐（QRC）与酷狗（KRC）能给出，而这两家用的是
+// **第三方私有编码**——本包只做兼容性解析以便显示逐字时间轴。有些用户不希望
+// 程序去解析这类格式（见 docs/43 的 H2），关掉之后这些来源仍然提供行级歌词，
+// 只是不再请求、也不再解密那份字级载荷。
+type WordLevelToggle interface {
+	// SetWordLevelEnabled 打开/关闭该来源的字级歌词。
+	SetWordLevelEnabled(on bool)
+}
+
+// Aggregator 并发使用多个 Provider 完成搜索与自动匹配。
+type Aggregator struct {
+	providers []Provider
+
+	mu    sync.RWMutex
+	cache map[string]cachedResult
+	// fetched 按「候选」（provider:id）缓存已抓到的歌词。
+	//
+	// 存在的理由：歌词搜索界面会先给每个候选**探一次格式**（逐字还是逐行，
+	// 见 ProbeLyricsFormat），用户随后点「使用」时不该再下载一遍同一份歌词。
+	// 与 cache（按搜索请求缓存、供 Match 用）分开：键不同、寿命也不同。
+	fetched map[string]cachedResult
+
+	// wordLevelOn / wordLevelSet 记录上一次同步的「字级歌词」开关。
+	//
+	// 为什么要记：开关由调用方在**每个调用点**按当前配置同步过来（自动匹配挂在
+	// 切歌路径上，读配置必须是最新值），而同步动作只有在**值真的变了**的时候
+	// 才该清缓存 —— 否则每切一首歌都会把 24h 的结果缓存清空。
+	wordLevelOn  bool
+	wordLevelSet bool
+}
+
+type cachedResult struct {
+	res Result
+	at  time.Time
+}
+
+// NewAggregator 创建聚合器；不传 Provider 时使用内置的四个来源。
+//
+// 顺序即优先级（同分时排前面的胜出）：
+//   - LRCLIB：国际化最好、有精确接口，稳定但只有行级；
+//   - 网易云：华语覆盖最好，但网页搜索接口会被限流（HTTP 200 + code 405）；
+//   - QQ 音乐：华语覆盖同样好、接口稳定，正好补上网易云被限流时的缺口；
+//     而且它的 QRC 是**逐字**的（见 qq_qrc.go），所以 QQ 同时也是一个字级来源；
+//   - 酷狗：能匿名拿到字级（KRC）歌词，且搜索到歌词之间要多走一步反查。
+//
+// 为什么不再只有两个来源：网易云一旦被限流，实际上只剩 LRCLIB 一个来源，
+// 而 LRCLIB 对中文歌的覆盖（尤其是近几年的新歌）并不算好，用户就会觉得
+// 「歌词搜索老是失败」。多一个稳定来源是最直接的解法。
+//
+// 酷狗排在最后是刻意的：它的搜索接口要多走一步（反查 KRC）才拿到歌词，
+// 同分时不该把排在前面的稳定来源挤掉；字级优先由 Match 单独负责
+// （拿到行级之后会再试一次声明了字级能力的来源），不靠这里的顺序。
+func NewAggregator(providers ...Provider) *Aggregator {
+	if len(providers) == 0 {
+		providers = []Provider{
+			NewLRCLIB(), NewNetease(), NewQQ(), NewKugou(),
+		}
+	}
+	return &Aggregator{
+		providers: providers,
+		cache:     map[string]cachedResult{},
+		fetched:   map[string]cachedResult{},
+	}
+}
+
+// Providers 返回当前注册的来源名称。
+func (a *Aggregator) Providers() []string {
+	out := make([]string, 0, len(a.providers))
+	for _, p := range a.providers {
+		out = append(out, p.Name())
+	}
+	return out
+}
+
+// SetWordLevelEnabled 运行时开关「字级（逐字）歌词」这条路。
+//
+// 语义：关掉之后声明了字级能力的来源（QQ / 酷狗）不再被要求多花一次请求，
+// 它们自己也改为只取行级歌词（不再解析 QRC / KRC 这类私有编码）。
+// 只有在值真的变化时才清缓存 —— 调用方会在每个调用点上按当前配置同步它。
+func (a *Aggregator) SetWordLevelEnabled(on bool) {
+	a.mu.Lock()
+	changed := a.wordLevelSet && a.wordLevelOn != on
+	a.wordLevelOn, a.wordLevelSet = on, true
+	a.mu.Unlock()
+
+	for _, p := range a.providers {
+		if t, ok := p.(WordLevelToggle); ok {
+			t.SetWordLevelEnabled(on)
+		}
+	}
+	if changed {
+		a.Invalidate()
+	}
+}
+
+// Invalidate 清空两级缓存（按搜索请求的匹配结果 + 按候选抓取的结果）。
+//
+// 用途：影响结果的设置变了（例如刚关掉字级歌词）之后，不能让旧结果继续生效 ——
+// cache 的寿命是 24h，不清就会出现「关了开关，这首还是逐字歌词」。
+func (a *Aggregator) Invalidate() {
+	a.mu.Lock()
+	a.cache = map[string]cachedResult{}
+	a.fetched = map[string]cachedResult{}
+	a.mu.Unlock()
+}
+
+// Search 并发查询所有 Provider，并按匹配度降序返回候选。
+func (a *Aggregator) Search(ctx context.Context, req SearchRequest) ([]Candidate, error) {
+	req = prepareRequest(req)
+	if len(a.providers) == 0 {
+		return nil, ErrNoMatch
+	}
+
+	type providerResult struct {
+		items []Candidate
+		err   error
+	}
+	// ★ 专供 provider goroutine 的 ctx：本函数「强命中提前收工」时会立刻取消它。
+	//
+	// 不能只依赖上面那个 ctx：它是调用方的，可能在整个匹配结束后才被取消。
+	// 于是「提前收工」返回后，慢来源的 goroutine 仍会跑满 providerTimeout，
+	// 期间没人读它的输出、却占着一条到 LRCLIB / 网易云 / QQ 的在途请求。
+	// 自动匹配歌词发生在每次切歌的路径上，快速切歌就会攒下成对的孤儿请求。
+	sctx, scancel := context.WithCancel(ctx)
+	defer scancel()
+
+	ch := make(chan providerResult, len(a.providers))
+	for _, p := range a.providers {
+		go func(p Provider) {
+			// 单来源超时。三个来源是并发跑的，所以总耗时由最慢的那个决定。
+			// 实测 LRCLIB / QQ 都在 1.5s 内返回，网易云被限流时 405 也是毫秒级；
+			// 6s 只用于兜住「某个源彻底卡住」的情况，比原来的 8s 更早给出结果。
+			// 更关键的是下面的「强命中就提前收工」，让慢来源通常根本等不到超时。
+			cctx, cancel := context.WithTimeout(sctx, providerTimeout)
+			defer cancel()
+			items, err := p.Search(cctx, req)
+			for i := range items {
+				if items[i].Provider == "" {
+					items[i].Provider = p.Name()
+				}
+			}
+			ch <- providerResult{items: items, err: err}
+		}(p)
+	}
+
+	// 收集：三个来源并发跑，但**不一定要等齐**。
+	//
+	// 只要某个来源给出了「强命中」（标题+歌手基本对上，见 strongScore），
+	// 再给其余来源一个很短的宽限窗口就返回 —— 否则一个卡住的来源会让
+	// 用户为了一个 1 秒就到手的正确答案等满 8 秒。
+	var all []Candidate
+	var errs []error
+	got := 0
+	graceTimer := time.NewTimer(searchGrace)
+	graceTimer.Stop()
+	var grace <-chan time.Time
+	for got < len(a.providers) {
+		select {
+		case r := <-ch:
+			got++
+			if r.err != nil {
+				errs = append(errs, r.err)
+				continue
+			}
+			strong := false
+			for i := range r.items {
+				r.items[i].Score = scoreCandidate(req, r.items[i])
+				if r.items[i].Score >= strongScore {
+					strong = true
+				}
+			}
+			all = append(all, r.items...)
+			if strong && grace == nil {
+				graceTimer.Reset(searchGrace)
+				grace = graceTimer.C
+			}
+		case <-grace:
+			// 提前收工：立刻掐掉还在跑的来源，别让它们继续占着在途请求。
+			scancel()
+			got = len(a.providers)
+		case <-ctx.Done():
+			scancel()
+			got = len(a.providers)
+		}
+	}
+	graceTimer.Stop()
+
+	// 排序：分数降序；**同分按来源声明顺序**（声明顺序即优先级）。
+	// 不能依赖 sort.SliceStable + 到达顺序：那样同分时谁先回来谁赢，
+	// 网络抖动会让同一首歌的匹配结果飘来飘去（用户会觉得「结果不稳定」）。
+	order := make(map[string]int, len(a.providers))
+	for i, p := range a.providers {
+		order[p.Name()] = i
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Score != all[j].Score {
+			return all[i].Score > all[j].Score
+		}
+		return order[all[i].Provider] < order[all[j].Provider]
+	})
+	// 时长优先：原唱 / 伴奏 / Live / 翻唱常常标题、歌手一模一样，只有时长
+	// 差几十秒。纯按分数排会选中错误的那一版，歌词整首对不上。
+	// 这一步只重排「分数已经接近」的候选，且没有任何时长对得上时原样返回。
+	all = orderByDuration(all, req.Duration)
+	if req.Limit > 0 && len(all) > req.Limit {
+		all = all[:req.Limit]
+	}
+	if len(all) == 0 {
+		if len(errs) > 0 {
+			return nil, errors.Join(errs...)
+		}
+		return nil, ErrNoMatch
+	}
+	return all, nil
+}
+
+const (
+	// strongScore 「强命中」的分数线：标题相等（70）+ 歌手相等（30）= 100，
+	// 标题强命中但歌手只是包含时也有 90 上下。到这个分就说明实体基本对齐了。
+	strongScore = 85
+	// searchGrace 拿到强命中后，还愿意为其余来源多等多久。
+	searchGrace = 1500 * time.Millisecond
+	// providerTimeout 单个来源的超时上限。
+	providerTimeout = 6 * time.Second
+)
+
+// Match 自动匹配并抓取歌词：先取评分最高的候选，失败时按分数向后重试。
+//
+// 关于**字级（逐字）歌词**的取舍（需求：优先使用字级歌词）——
+// 抓取之前无从知道一个候选给的是行级还是字级，想挑字级就只能「抓到行级再去
+// 抓下一个候选」；而多数来源给的就是行级，那等于把每次自动匹配都变成两次
+// 请求。自动匹配跑在**切歌**路径上（25s 预算，实测慢一拍就会被当成「卡住了」），
+// 所以这里的做法是**有上限的两步**：
+//
+//  1. 按分数顺序抓第一个候选（与原来完全一样，一次请求）；
+//  2. 拿到的是字级 → 直接用它；拿到的是行级 → 只为「声明了字级能力」的来源
+//     （WordProvider，目前是 QQ 与酷狗）再多花**一次**请求；那一次拿到字级就换成它，
+//     否则仍旧回退到第 1 步那份行级歌词。
+//
+// 也就是说「有逐字就播逐字、没有就播逐行」的代价最多是一次额外请求，
+// 且只在【最匹配的那个候选给的是行级】时才发生。
+//
+// 字级偏好还有另外两层，这里不是唯一的一处：
+//   - 同一个来源的返回里**优先取字级字段**（见 netease.go#neteaseLyricText）；
+//   - 本地来源之间**字级优先于行级**（见 internal/lyrics#Load）。
+func (a *Aggregator) Match(ctx context.Context, req SearchRequest) (Result, error) {
+	req = prepareRequest(req)
+	if req.Title == "" && req.Keyword == "" {
+		return Result{}, fmt.Errorf("缺少歌曲标题")
+	}
+	key := cacheKey(req)
+	if v, ok := a.getCache(key); ok {
+		return v, nil
+	}
+
+	candidates, err := a.Search(ctx, req)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(candidates) == 0 {
+		return Result{}, ErrNoMatch
+	}
+	if candidates[0].Score < 35 {
+		return Result{}, ErrNoMatch
+	}
+
+	// matchTries 最多抓几次：第一次是「版本最对的那个」，第二次留给字级。
+	const matchTries = 2
+	var fallback Result
+	var lastErr error
+	tries := 0
+	for _, c := range candidates {
+		if c.Score < 30 {
+			break
+		}
+		// 已经有一份行级结果在手时，只为可能给字级的来源继续花请求。
+		if fallback.LRC != "" && !a.wordCapable(c.Provider) {
+			continue
+		}
+		if tries >= matchTries {
+			break
+		}
+		p := a.provider(c.Provider)
+		if p == nil {
+			continue
+		}
+		res, err := p.Fetch(ctx, c)
+		tries++
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(res.LRC) == "" {
+			lastErr = fmt.Errorf("%s 返回了空歌词", c.Provider)
+			continue
+		}
+		if res.Provider == "" {
+			res.Provider = c.Provider
+		}
+		if res.Source == "" {
+			res.Source = c.Provider
+		}
+		res.Candidate = c
+		if lyrics.HasWordTiming(res.LRC) {
+			a.setCache(key, res)
+			return res, nil
+		}
+		if fallback.LRC == "" {
+			fallback = res
+		}
+	}
+	if fallback.LRC != "" {
+		a.setCache(key, fallback)
+		return fallback, nil
+	}
+	if lastErr != nil {
+		return Result{}, lastErr
+	}
+	return Result{}, ErrNoMatch
+}
+
+// wordCapable 该来源是否声明了「可能给字级歌词」。
+func (a *Aggregator) wordCapable(name string) bool {
+	p := a.provider(name)
+	if p == nil {
+		return false
+	}
+	wp, ok := p.(WordProvider)
+	return ok && wp.HasWordLevel()
+}
+
+// SearchByText 便于外部直接按标题/歌手搜索。
+func (a *Aggregator) SearchByText(ctx context.Context, title, artist string, duration int64) ([]Candidate, error) {
+	return a.Search(ctx, SearchRequest{Title: title, Artist: artist, Duration: duration})
+}
+
+func (a *Aggregator) provider(name string) Provider {
+	for _, p := range a.providers {
+		if p.Name() == name {
+			return p
+		}
+	}
+	return nil
+}
+
+// cacheTTL 缓存有效期；maxCacheEntries 条数上限。
+//
+// 上限是必须的：每个 key 一条记录，而每条都含完整 LRC 文本与解析后的行数组。
+// 以前只判过期、从不删除，条目会随试听/切歌一直累积到进程结束
+// （coverfetch 的同类缓存早就有 512 的上限）。
+const (
+	cacheTTL        = 24 * time.Hour
+	maxCacheEntries = 512
+)
+
+func (a *Aggregator) getCache(key string) (Result, bool) {
+	a.mu.RLock()
+	v, ok := a.cache[key]
+	a.mu.RUnlock()
+	if !ok || time.Since(v.at) > cacheTTL {
+		return Result{}, false
+	}
+	return v.res, true
+}
+
+func (a *Aggregator) setCache(key string, res Result) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.cache) >= maxCacheEntries {
+		a.evictExpiredLocked()
+	}
+	a.cache[key] = cachedResult{res: res, at: time.Now()}
+}
+
+// evictExpiredLocked 先清过期条目；清完仍超限就整体清空（调用方持锁）。
+func (a *Aggregator) evictExpiredLocked() {
+	for k, v := range a.cache {
+		if time.Since(v.at) > cacheTTL {
+			delete(a.cache, k)
+		}
+	}
+	if len(a.cache) >= maxCacheEntries {
+		a.cache = map[string]cachedResult{}
+	}
+}
+
+func prepareRequest(req SearchRequest) SearchRequest {
+	req.Title = strings.TrimSpace(req.Title)
+	req.Artist = strings.TrimSpace(req.Artist)
+	req.Album = strings.TrimSpace(req.Album)
+	req.Keyword = strings.TrimSpace(req.Keyword)
+	if req.Keyword == "" {
+		req.Keyword = strings.TrimSpace(strings.Join([]string{req.Title, req.Artist}, " "))
+	}
+	if req.Limit <= 0 {
+		req.Limit = 12
+	}
+	return req
+}
+
+func cacheKey(req SearchRequest) string {
+	return normalize(req.Title) + "|" + normalize(req.Artist) + "|" + strconv.FormatInt(req.Duration, 10)
+}
+
+/* --------------------------------------------------------------------------
+   匹配度评分
+   -------------------------------------------------------------------------- */
+
+func scoreCandidate(req SearchRequest, c Candidate) int {
+	score := 0
+
+	titleReq := normalize(req.Title)
+	titleCan := normalize(c.Title)
+	if titleReq != "" && titleCan != "" {
+		switch {
+		case titleReq == titleCan:
+			score += 70
+		case strings.Contains(titleCan, titleReq) || strings.Contains(titleReq, titleCan):
+			score += 48
+		default:
+			score += int(similarity(titleReq, titleCan) * 55)
+		}
+	} else {
+		score += 20 // 没有标题信息时不做否定，只给基础分
+	}
+
+	if req.Artist != "" {
+		artistReq := normalize(req.Artist)
+		artistCan := normalize(c.Artist)
+		switch {
+		case artistReq != "" && artistReq == artistCan:
+			score += 30
+		case artistReq != "" && artistCan != "" && (strings.Contains(artistCan, artistReq) || strings.Contains(artistReq, artistCan)):
+			score += 22
+		default:
+			score += int(similarity(artistReq, artistCan) * 16)
+		}
+	} else {
+		score += 8
+	}
+
+	if req.Duration > 0 && c.Duration > 0 {
+		diff := req.Duration - c.Duration
+		if diff < 0 {
+			diff = -diff
+		}
+		switch {
+		case diff <= 2000:
+			score += 15
+		case diff <= 5000:
+			score += 10
+		case diff <= 10000:
+			score += 5
+		case diff <= 20000:
+			score += 0
+		case diff <= 60000:
+			score -= 12
+		default:
+			score -= 25
+		}
+	}
+	if c.HasLyrics {
+		score += 5
+	}
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	return score
+}
+
+/* --------------------------------------------------------------------------
+   时长优先
+   -------------------------------------------------------------------------- */
+
+const (
+	// durationRankTolerance 「时长算相同」的容差（毫秒）。
+	//
+	// 不卡到 0：各来源报的时长与本地文件本来就有 1~2 秒的正常误差
+	// （前奏静音、编码 padding、不同发行版、抓取时的截断），卡死会把
+	// 正确答案一起筛掉，用户看到的就是「明明有完全一样的歌词却匹配不上」。
+	durationRankTolerance = 2000
+
+	// durationRankWindow 允许参与「时长优先」重排的最大分差。
+	//
+	// 只把分数已经接近的候选拿来比时长：一个「标题只沾边、时长刚好一样」
+	// 的结果不该被顶到第一位 —— 错的歌词比没有歌词更糟。
+	// 取 18 是因为时长在同一档最多贡献 15 分，再加一点余量。
+	durationRankWindow = 18
+)
+
+// orderByDuration 稳定地把「时长与目标一致」的候选提到前面。
+//
+// 需求：自动匹配歌词时应当**优先匹配时长相同的版本**，没有对得上的再回退。
+//
+// 为什么不是「把时长权重调大」：分数还要兼顾标题与歌手的相似度，
+// 加权后的结果仍然可能出现「标题更接近但版本不对」压过「版本正确」的情况。
+// 这里改成先按分数排出前几名，再在其中挑时长对得上的 —— 语义是
+// 「在同样可信的候选里，选时长对得上的那一版」，与需求的措辞一致。
+//
+// 返回值可能是重排后的副本；确实没有时长对得上的候选时**原样返回**入参。
+func orderByDuration(cands []Candidate, want int64) []Candidate {
+	if want <= 0 || len(cands) < 2 {
+		return cands
+	}
+	best := cands[0].Score
+	hasExact := false
+	for _, c := range cands {
+		if c.Duration <= 0 || c.Score < best-durationRankWindow {
+			continue
+		}
+		if absDuration(want, c.Duration) <= durationRankTolerance {
+			hasExact = true
+			break
+		}
+	}
+	if !hasExact {
+		return cands
+	}
+
+	// band=0 表示「分数够格、可以参与时长比较」，band=1 的排在后面。
+	// diff 是时长差的绝对值；来源没给时长时用一个大值，排在给得出来的后面。
+	const noDuration = int64(1) << 62
+	type key struct {
+		band  int
+		exact int
+		diff  int64
+	}
+	keyOf := func(c Candidate) key {
+		k := key{diff: noDuration}
+		if c.Score < best-durationRankWindow {
+			k.band = 1
+		}
+		if c.Duration > 0 {
+			k.diff = absDuration(want, c.Duration)
+			if k.diff <= durationRankTolerance {
+				k.exact = 1
+			}
+		}
+		return k
+	}
+
+	out := append([]Candidate(nil), cands...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ki, kj := keyOf(out[i]), keyOf(out[j])
+		if ki.band != kj.band {
+			return ki.band < kj.band
+		}
+		if ki.exact != kj.exact {
+			return ki.exact > kj.exact
+		}
+		if ki.diff != kj.diff {
+			return ki.diff < kj.diff
+		}
+		return false
+	})
+	return out
+}
+
+func absDuration(a, b int64) int64 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
+}
+
+// normalize 去掉常见括号内容、标点与大小写差异，便于比较。
+func normalize(s string) string {
+	s = stripBracketed(s)
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func stripBracketed(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '(', '（', '[', '［', '【', '〔', '《':
+			depth++
+			continue
+		case ')', '）', ']', '］', '】', '〕', '》':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func similarity(a, b string) float64 {
+	if a == "" || b == "" {
+		return 0
+	}
+	ra, rb := []rune(a), []rune(b)
+	l := lcsLen(ra, rb)
+	m := len(ra)
+	if len(rb) > m {
+		m = len(rb)
+	}
+	if m == 0 {
+		return 0
+	}
+	return float64(l) / float64(m)
+}
+
+func lcsLen(a, b []rune) int {
+	dp := make([]int, len(b)+1)
+	for _, ca := range a {
+		prev := 0
+		for j, cb := range b {
+			cur := dp[j+1]
+			if ca == cb {
+				dp[j+1] = prev + 1
+			} else if dp[j] > dp[j+1] {
+				dp[j+1] = dp[j]
+			}
+			prev = cur
+		}
+	}
+	return dp[len(b)]
+}
+
+// Fetch 按 provider+id 获取指定候选的歌词。
+//
+// 结果按**候选**缓存一小段时间：歌词搜索界面会先探格式（逐字还是逐行）、
+// 用户再点「使用」，两次请求的是同一份歌词，没有这层缓存就要白下载一遍。
+func (a *Aggregator) Fetch(ctx context.Context, providerName, id string) (Result, error) {
+	key := providerName + ":" + id
+	if v, ok := a.getFetched(key); ok {
+		return v, nil
+	}
+	p := a.provider(providerName)
+	if p == nil {
+		return Result{}, fmt.Errorf("unknown lyric provider: %s", providerName)
+	}
+	res, err := p.Fetch(ctx, Candidate{Provider: providerName, ID: id})
+	if err != nil {
+		return Result{}, err
+	}
+	if res.Provider == "" {
+		res.Provider = providerName
+	}
+	if res.Source == "" {
+		res.Source = providerName
+	}
+	a.setFetched(key, res)
+	return res, nil
+}
+
+const (
+	// fetchCacheTTL 按候选缓存的有效期：比 cache 短得多 —— 用户可能过一会儿
+	// 重新搜一次同一首歌，那时该拿上游的新结果（歌词是会改的）。
+	fetchCacheTTL = 10 * time.Minute
+	// maxFetchEntries 条数上限；满了先清过期，仍超限就整体清空（与 cache 一致）。
+	maxFetchEntries = 64
+)
+
+func (a *Aggregator) getFetched(key string) (Result, bool) {
+	a.mu.RLock()
+	v, ok := a.fetched[key]
+	a.mu.RUnlock()
+	if !ok || time.Since(v.at) > fetchCacheTTL {
+		return Result{}, false
+	}
+	return v.res, true
+}
+
+func (a *Aggregator) setFetched(key string, res Result) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.fetched) >= maxFetchEntries {
+		for k, v := range a.fetched {
+			if time.Since(v.at) > fetchCacheTTL {
+				delete(a.fetched, k)
+			}
+		}
+		if len(a.fetched) >= maxFetchEntries {
+			a.fetched = map[string]cachedResult{}
+		}
+	}
+	a.fetched[key] = cachedResult{res: res, at: time.Now()}
+}

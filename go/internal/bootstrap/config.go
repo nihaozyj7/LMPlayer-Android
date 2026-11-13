@@ -1,0 +1,1769 @@
+// Package bootstrap 负责数据模型定义与配置持久化。
+//
+// 约定：本包中的结构体是前端与本地的唯一数据契约，
+// 字段名必须与 frontend/src/js 下的读取字段保持一致（JSON tag 即字段名）。
+package bootstrap
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"localmusicplayer/internal/atomicfile"
+	"localmusicplayer/internal/lyrics"
+)
+
+/* --------------------------------------------------------------------------
+   数据模型（与前端 store.js / mock.js 字段一一对应）
+   -------------------------------------------------------------------------- */
+
+// Folder 一个被监听的本地音乐目录
+type Folder struct {
+	ID         string `json:"id"`
+	Path       string `json:"path"`
+	TrackCount int    `json:"trackCount"`
+	Status     string `json:"status"` // ok | missing | denied
+	Watching   bool   `json:"watching"`
+	AddedAt    int64  `json:"addedAt"`
+}
+
+// Song 一首本地歌曲
+type Song struct {
+	ID         string `json:"id"`
+	Path       string `json:"path"`
+	Title      string `json:"title"`
+	Artist     string `json:"artist"`
+	Album      string `json:"album"`
+	Ext        string `json:"ext"`
+	Duration   int64  `json:"duration"` // 毫秒
+	Size       int64  `json:"size"`     // 字节
+	SampleRate int    `json:"sampleRate"`
+	Bitrate    int    `json:"bitrate"`
+	AddedAt    int64  `json:"addedAt"`
+	PlayCount  int    `json:"playCount"`
+	Cover      string `json:"cover,omitempty"` // data URL；无封面时为空字符串
+	// CoverURL 是同源封面地址（形如 /cover/<内容hash>.jpg?t=…），指向封面缓存
+	// 目录里的内容寻址文件。
+	//
+	// 为什么本地歌曲走 URL 而不是 Cover 里的 base64：内嵌封面平均 143KB，
+	// base64 后还会膨胀 1/3 —— 整库塞进列表接口意味着 5,000 首约 484MB 的 IPC
+	// 载荷（每次 scan:done 都要重来一遍，含文件夹监听触发的增量重扫）。
+	// 给 URL 之后列表载荷只剩几十字节/首，图片由浏览器按 immutable 长缓存按需取，
+	// 同一张封面只下载一次。Cover 字段保留给仍需要内嵌 data URL 的场景（在线曲目）。
+	CoverURL string `json:"coverUrl,omitempty"`
+	ModTime  int64  `json:"-"` // 仅用于元数据缓存判定
+}
+
+// Playlist 歌单；「我喜欢」是受限歌单（Locked=true，不可删除）
+type Playlist struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Locked    bool     `json:"locked"`
+	Builtin   bool     `json:"builtin"`
+	SongIDs   []string `json:"songIds"`
+	CreatedAt int64    `json:"createdAt"`
+}
+
+// FilterRule 过滤规则，语义与前端 store.js#matchRules 完全一致：
+//   - exclude 命中即排除（优先）
+//   - 存在启用的 include 规则时，必须至少命中一条才保留
+type FilterRule struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`  // size | regex
+	Op      string `json:"op"`    // size: lt|lte|gt|gte|eq   regex: match
+	Value   string `json:"value"` // size: 数字   regex: 正则源码
+	Unit    string `json:"unit"`  // B | KB | MB | GB
+	Scope   string `json:"scope"` // exclude | include
+	Enabled bool   `json:"enabled"`
+}
+
+// CustomTheme 用户自定义主题的元信息（CSS 内容按需读取，不常驻内存）
+type CustomTheme struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Mode    string   `json:"mode"` // dark | light
+	Swatch  []string `json:"swatch"`
+	Builtin bool     `json:"builtin"`
+}
+
+// Config 应用配置（落盘为 JSON，可直接手改）
+type Config struct {
+	Theme      string `json:"theme"`
+	ThemeMode  string `json:"themeMode"` // dark | light | system
+	GlassBlur  int    `json:"glassBlur"`
+	GlassAlpha int    `json:"glassAlpha"`
+	// WindowCorners 主窗口圆角：system | round | small | square（见 NormalizeWindowCorners）。
+	// 同样是 Windows 11 的能力，但它改的是运行期可写的 DWM 属性，改完立刻生效、不用重启。
+	WindowCorners string `json:"windowCorners"`
+	Animations    bool   `json:"animations"`
+	// AnimationsSpeed 界面过渡速度：fast（0.25s）| medium（0.5s）| slow（0.75s）。
+	// 前端把它换算成 --dur 令牌，全站动效（含各种弹出层）都从这一个令牌取值。
+	AnimationsSpeed string `json:"animationsSpeed"`
+	// SkinPerformanceMode 播放界面**背景动效**的帧率档位：smooth | performance。
+	//
+	// 只作用于「播放详情页里皮肤自己画的背景动画」（canvas / rAF 循环）：
+	//   smooth（默认）—— 跟随显示刷新率（120Hz 屏就跑到 120fps），最流畅；
+	//   performance  —— 播放中 45fps / 空闲 22fps / 暂停 6 秒后完全停帧，省电。
+	//
+	// 为什么默认 smooth：这两个档位的差别只有「要更流畅」还是「要更省电」，
+	// 而用户在高刷屏上最容易感知到的就是不够流畅。省电档保留给笔记本用户。
+	//
+	// 为什么**只管背景**：设置界面、曲库列表等非播放器界面本来就没有 canvas
+	// 与 rAF 循环（它们不挂皮肤），天然就是满帧的，不需要也不应该受这个开关影响。
+	SkinPerformanceMode string `json:"skinPerformanceMode"`
+	AccentFromCover     bool   `json:"accentFromCover"`
+	ShowAlbumColumn     bool   `json:"showAlbumColumn"`
+	ShowLyrics          bool   `json:"showLyrics"`
+
+	PlayMode       string  `json:"playMode"` // sequence | loop-all | loop-one | shuffle
+	Volume         float64 `json:"volume"`
+	Muted          bool    `json:"muted"`
+	PlayerViewMode string  `json:"playerViewMode"` // classic | immersive | minimal
+
+	AutoScanOnStart bool `json:"autoScanOnStart"`
+	WatchFolders    bool `json:"watchFolders"`
+	ScanConcurrency int  `json:"scanConcurrency"`
+
+	LyricsFontSize int      `json:"lyricsFontSize"`
+	LyricsLines    int      `json:"lyricsLines"`
+	LyricsSources  []string `json:"lyricsSources"`
+
+	// —— 响度均衡 ——
+	// 注意：这三个字段以前只存在前端的 localStorage 里，后端不认识，
+	// 于是「设置里改了均衡模式 → 重启后又变回关闭」。它们必须落盘。
+	LoudnessMode   string  `json:"loudnessMode"`   // off | track | album
+	LoudnessTarget float64 `json:"loudnessTarget"` // 目标整合响度 LUFS
+	LoudnessLimit  bool    `json:"loudnessLimit"`  // 真峰值保护
+
+	// —— 在线功能 ——
+	// DownloadDir 在线歌曲下载的保存目录。默认是系统「音乐」目录下的 downloads。
+	DownloadDir string `json:"downloadDir"`
+	// OnlineCover 是否联网为在线歌曲抓取封面（多来源，见 internal/coverfetch）。
+	OnlineCover bool `json:"onlineCover"`
+	// OnlineWordLyrics 在线歌词是否优先使用「字级（逐字）」来源。
+	//
+	// 字级歌词只有 QQ 音乐（QRC）与酷狗（KRC）能给，而这两家用的是**第三方私有
+	// 编码**：本程序只做兼容性解析以便显示逐字时间轴（见 internal/lyricsfetch）。
+	// 关掉后不再请求/解析这两种编码，只用行级来源 —— 歌词照常可用，只是没有逐字高亮。
+	// 这是给「不希望涉及私有格式解析」的用户留的开关，默认开启（与加入它之前行为一致）。
+	OnlineWordLyrics bool `json:"onlineWordLyrics"`
+	// EmbedMeta 是否把抓到的封面/歌词写回歌曲文件自身的标签。
+	// 默认关闭：写标签会改写用户的音乐文件，必须是用户明确开启的行为。
+	// 关闭时封面与歌词仍然可用，只是放在缓存目录里（见 internal/metacache）。
+	EmbedMeta bool `json:"embedMeta"`
+
+	// —— 交互 ——
+	// RowClickAction 单击歌曲行的行为（与前端 settings.js 的 ROW_CLICK_ACTIONS 一一对应）：
+	//   play      —— 播放：播这一首，并把它加进播放列表（不动现有列表，默认）
+	//   play-list —— 播放当前列表：播这一首，并用当前整个列表替换播放队列
+	//   next      —— 下一首播放：插到当前歌曲后面（不打断当前播放）
+	RowClickAction string `json:"rowClickAction"`
+	// ResumeProgress 是否保留歌曲播放进度：打开后退出应用会记住每首歌播到哪儿，
+	// 下次打开回到那个位置（只恢复进度条，不会自动播放）。
+	// 每首歌的具体位置由前端随快照存在本地（localStorage），后端只保存这个开关。
+	ResumeProgress bool `json:"resumeProgress"`
+	// RememberVolume 是否记住上次的音量：关闭后每次启动都用默认音量。
+	RememberVolume bool `json:"rememberVolume"`
+	// ListDensity 列表密度：compact | cozy | roomy。
+	// 原来每张表头各有一个密度按钮，现在统一到设置里，对所有列表生效。
+	ListDensity string `json:"listDensity"`
+
+	// MinimizeToTray 点窗口关闭按钮时「最小化到系统托盘」而不是退出应用。
+	//
+	// 关闭行为在主窗口的 WindowClosing **钩子**里判断（见 main.go）：钩子比
+	// 监听器先跑，取消事件就能让 Wails 内建的「关窗 = 销毁窗口」不发生。
+	// 托盘图标由 WindowService 按同一个开关创建 / 销毁（见 services.go#ensureTray）。
+	MinimizeToTray bool `json:"minimizeToTray"`
+
+	// —— 版本更新（见 services_update.go）——
+	//
+	// UpdateCheckOnStart 启动后在后台静默检查一次有没有新版本。
+	//
+	// 为什么默认开启：更新检查唯一的价值就是「用户不知道有新版本时也能拿到」。
+	// 默认关闭的话，只有主动进设置点「检查更新」的人才会发现 —— 而那批人本来
+	// 就会自己去 GitHub 看。检查只是一次几 KB 的请求，且失败完全静默。
+	UpdateCheckOnStart bool `json:"updateCheckOnStart"`
+	// UpdateChannel 是下载更新时优先使用的通道：auto（默认）或某个代理 id。
+	//
+	// 用户显式选过之后要记住：他之所以去选，通常是因为自动模式在他的网络下
+	// 成功过某条代理，下次不该让他重新试一遍。
+	UpdateChannel string `json:"updateChannel"`
+	// SkippedVersion 是用户点了「跳过此版本」的那个版本号。
+	//
+	// 存在的原因：更新提示会反复出现（每次启动都检查），而「我知道有新版本、
+	// 但现在不想升」是完全合理的选择。没有这个字段的话，用户唯一的办法
+	// 就是关掉自动检查 —— 那会让他连以后的版本也一起错过。
+	SkippedVersion string `json:"skippedVersion"`
+
+	// —— 插件仓库（主题 / 样式包，见 services_packs.go）——
+	//
+	// PackSource 是仓库里 plugins 目录的基地址：程序从这里读
+	// <PackSource>/theme/index.json 与 <PackSource>/style/index.json，
+	// 再把用户挑中的条目装到本机。
+	//
+	// 为什么可配置而不是写死常量：它天然会变 —— 仓库改名、换分支、用户想自建
+	// 一个只放插件的仓库、开发时指向本地目录，写死的话每种都要改代码重编译。
+	// 默认值是项目仓库 main 分支的 plugins 目录。
+	//
+	// 它不进 applyPatch / SYNCED_KEYS，而是由 PackService.SetSource 单独管
+	// （与 UpdateChannel 同一套做法）：这类「渠道地址」是一次性动作的入参，
+	// 走前端 400ms 防抖同步的话，「刚改完立刻点获取」很可能拿到旧值。
+	PackSource string `json:"packSource"`
+
+	// —— 封面取色（cover-dark 主题）——
+	// CoverSeed / CoverSeed2 是上一次从封面里提取得出的主色（十六进制）。
+	//
+	// 为什么要落盘：主题是在页面脚本跑起来之后才套用的，而取色还要等封面
+	// 图片解码完 —— 于是「启动 → 先用主题里写死的占位灰 → 取完色再整体重绘」，
+	// 肉眼看就是先黑一下、颜色还偏灰。把上次的取色结果记下来，Go 侧就能在
+	// 页面首屏之前把它写进 <html>，首帧直接就是对的颜色（见 early_theme.go）。
+	CoverSeed  string `json:"coverSeed"`
+	CoverSeed2 string `json:"coverSeed2"`
+
+	// ShowDesktopLyrics 是否显示桌面歌词（独立透明置顶窗口）。
+	ShowDesktopLyrics bool `json:"showDesktopLyrics"`
+	// DesktopLyricsX / DesktopLyricsY 桌面歌词窗口**上次被拖到哪儿**
+	// （DIP 逻辑像素，与窗口 Position() 同一坐标系）。
+	//
+	// 为什么必须记：这个窗口的拖拽是系统级的（CSS --wails-draggable），
+	// JS 收不到任何拖拽事件，窗口一销毁位置就彻底丢了 ——
+	// 表现就是「每次启动都跑回屏幕底部中间，每次都要重拖」。
+	//
+	// 用 -1 表示「没存过」：0 是合法坐标（副屏在主屏左侧时 X 就是负的，
+	// 而 0 是常见位置），不能拿 0 当哨兵值。
+	DesktopLyricsX int `json:"desktopLyricsX"`
+	DesktopLyricsY int `json:"desktopLyricsY"`
+
+	// MainWindowX / MainWindowY / MainWindowW / MainWindowH 主窗口**上次摆在哪儿、
+	// 多大**（DIP 逻辑像素，与窗口 Position()/Size() 同一坐标系）。
+	//
+	// 为什么必须记：主窗口是无边框自绘的（Frameless），标题栏上的「最大化 / 还原」
+	// 走的是我们自己的按钮而不是系统菜单，窗口自己不会记住任何几何信息 ——
+	// 不落盘的话每次启动都是「1280×820 居中」，用户每回都要重新摆一次。
+	//
+	// 位置与尺寸分开判断「存过没有」：W/H 用 0 当哨兵是安全的（0 宽窗口没有意义），
+	// 而 X/Y 必须用 -1（0 是合法坐标，副屏在主屏左侧时 X 甚至为负，
+	// 理由与 DesktopLyricsNoPos 完全相同）。
+	MainWindowX int `json:"mainWindowX"`
+	MainWindowY int `json:"mainWindowY"`
+	MainWindowW int `json:"mainWindowW"`
+	MainWindowH int `json:"mainWindowH"`
+	// MainWindowMaximized 上次退出时主窗口是不是最大化状态。
+	//
+	// 单独存一个布尔而不是把最大化后的尺寸写进 W/H：最大化时窗口尺寸由系统按
+	// 当前显示器算，把它写进 W/H 会让「最大化退出 → 还原」回到一个占满屏幕的
+	// 「普通」窗口，用户再点还原就回不到真正想要的大小了。
+	MainWindowMaximized bool `json:"mainWindowMaximized"`
+	// ShowDesktopWallpaper 是否显示桌面背景歌词（铺满桌面、压在桌面图标之下的
+	// 壁纸层窗口，见 desktop_wallpaper.go）。
+	//
+	// 与 ShowDesktopLyrics 是**二选一**：两者都在回答同一个问题「歌词放在桌面的
+	// 哪儿」，同时开着既是双份资源，视觉上也是两条歌词叠在一起。互斥由
+	// WindowService.setDesktopMode 单点保证，配置里同时为 true 时以 wallpaper 优先
+	// （见 main.go 的启动恢复）。
+	ShowDesktopWallpaper bool `json:"showDesktopWallpaper"`
+	// AutoStartDesktopWallpaper 是否在**每次启动时**自动打开桌面背景歌词。
+	//
+	// 为什么要有它：ShowDesktopWallpaper 既表示「现在开着」，也曾经隐式表示
+	// 「下次启动也开着」—— 用户临时开着看了一会儿、关掉程序，下次启动它又冒出来。
+	// 现在把这两件事拆开：
+	//   · ShowDesktopWallpaper     = 本次运行开不开（随开关实时落盘）；
+	//   · AutoStartDesktopWallpaper = 启动时要不要自动开。
+	// 关掉后者之后，本次仍然可以手动打开背景歌词，只是重启后不再自动出现 ——
+	// 这正是「关闭后则桌面背景歌词只在本次启动生效」。
+	//
+	// 默认 true：与加入这个开关之前的行为一致（开过就会被记住并在下次启动恢复）。
+	// 它只在 Windows 上有意义（别的平台 desktopWallpaperSupport 恒为不支持）。
+	AutoStartDesktopWallpaper bool `json:"autoStartDesktopWallpaper"`
+	// SleepAfterSong 定时停止的「播放完歌曲（延长到歌曲播放结束）」选项。
+	//
+	// 打开后：倒计时到点时**不立刻暂停**，而是等当前这首播完再停。
+	// 这是「睡眠定时」的常见语义 —— 用户想听到正在听的这首结束，
+	// 而不是在副歌中间被掐掉。
+	SleepAfterSong bool `json:"sleepAfterSong"`
+	// ShuffleMode 随机播放行为：reshuffle | once。
+	ShuffleMode string `json:"shuffleMode"`
+
+	// —— 跳过静音（见 internal/audioplay/silence.go）——
+	//
+	// SkipSilenceHead / SkipSilenceTail 分别控制「跳过开头无声」与「跳过结尾无声」。
+	//
+	// 为什么做成两个开关而不是一个「跳过静音」：这两件事解决的是完全不同的问题 ——
+	//   · 开头静音 —— 很多无损/现场转录的文件前面有几秒空白，点播放却迟迟不出声，
+	//     听感上像「播放器卡了」；
+	//   · 结尾静音 —— CD 抓轨与整轨转录的文件尾部常常拖十几秒空白，
+	//     自动下一首会白白等完那一段。
+	// 用户完全可能只想解决其中一个（比如就想要「听完尾奏再切歌」）。
+	//
+	// 检测在装载时对解码后的 PCM 做（见 audioplay.DetectSilence），结果按文件缓存，
+	// 所以同一首歌第二次播放零开销。
+	SkipSilenceHead bool `json:"skipSilenceHead"`
+	SkipSilenceTail bool `json:"skipSilenceTail"`
+
+	// TrackGapSeconds 是切歌时两首歌之间的间隔（秒）。
+	//
+	// 它作用于**自动切歌**（上一首播完 → 下一首起播）之间的停顿，默认 1.5 秒。
+	// 用户手动点下一首 / 点播某一首时不等这个间隔 —— 那是明确的即时意图，
+	// 中间插一段静音只会显得播放器反应慢。
+	//
+	// 0 表示不留间隔（播完立刻接上）。
+	TrackGapSeconds float64 `json:"trackGapSeconds"`
+
+	// EffectPreset 是当前的音效档位（见 internal/audioplay/effects.go）。
+	//
+	// 取值：off | vocal | bass | surround
+	//
+	// ★ 默认 off 是刻意的，与「响度均衡」「跳过静音」同一立场：
+	// 任何改动音频本身的处理都必须由用户明确开启。开音效会改变用户
+	// 听到的声音（EQ 会调整频响），默认开就等于"每个用户都被静音地
+	// 加了一层处理"——那是不可接受的。
+	//
+	// 存字符串而不是数字：这个值要落盘、要传给前端、要出现在诊断信息里。
+	// 数字在配置文件里完全不可读，而字符串写错了能一眼看出来
+	//（非法值由 audioplay.NormalizeEffectPreset 收敛到 off）。
+	EffectPreset string `json:"effectPreset"`
+
+	// —— 封面轮播（播放详情页）——
+	// CoverCarousel 是否轮播多张封面。
+	// 刻意做成**全局偏好**而不是每首一份：一首歌有几张封面是数据，
+	// 「要不要轮着看」是习惯；放进每首歌里会出现「这首开、那首关」，
+	// 用户根本记不住自己在哪首开的。
+	CoverCarousel bool `json:"coverCarousel"`
+	// CoverCarouselInterval 轮播间隔（秒），下限 2 秒，默认 10 秒。
+	CoverCarouselInterval int `json:"coverCarouselInterval"`
+
+	// —— AI 元数据清洗（设置 → AI 元数据）——
+	AIBaseURL string `json:"aiBaseUrl"`
+	// AIBaseURLProblem 是派生字段：只在序列化给前端时被填充，不落盘。
+	//
+	// 装的是「这个接口地址不会被使用」的原因（由 NormalizeAIBaseURL 算出来，
+	// 出错信息本身不回显地址）。为什么要把它交给前端：地址不合法时程序会
+	// **拒绝发送密钥**（services_ai.go#ExtractMeta），如果界面上不说明原因，
+	// 用户看到的就是「AI 莫名其妙不工作」—— 例如把地址填成局域网模型服务的
+	// `http://192.168.x.x:1234`，而这正是必须拒绝的（密钥会明文出网卡）。
+	//
+	// ★ 规则只有一份（Go 侧），前端不再自己实现一遍：两边各写一套校验必然会
+	// 漂移，而这里的漂移代价是「界面说没问题、后端却拒绝发请求」。
+	AIBaseURLProblem string `json:"aiBaseUrlProblem,omitempty"`
+	// AIAPIKey 是密钥本身。**只用于持久化与后端调用，不原样交给前端**：
+	// ConfigService.Get 会把它打码（见 services.go#maskSecret）。
+	// 前端判断「配没配」应当看下面的 AIAPIKeySet。
+	AIAPIKey string `json:"aiApiKey"`
+	// AIAPIKeySet 是派生字段：只在序列化给前端时被填充，不落盘。
+	// 为什么单独给一个布尔位：密钥被打码之后前端无法再区分
+	// 「没配」与「配了但我不告诉你」，没有它 AI 卡片的状态提示会失真。
+	AIAPIKeySet bool   `json:"aiApiKeySet,omitempty"`
+	AIThinking  bool   `json:"aiThinking"`
+	AIModelID   string `json:"aiModelId"`
+	// AIVendor 模型类型（厂商）。思考模式的开关字段各家不同
+	// （reasoning_effort / thinking / enable_thinking / reasoning …），
+	// 必须知道调的是哪家才能发出正确的请求体；auto = 按接口地址与模型名猜。
+	// 取值见 ai_vendor.go 的 aiVendorCatalog。
+	AIVendor string `json:"aiVendor"`
+	// AILyricsClean 自动匹配歌词时，是否先用 AI 清洗元数据。
+	//
+	// AI 清洗能明显提高脏文件名的歌词命中率，但一次调用要 8~18 秒，
+	// 而歌词自动匹配发生在每次切歌的路径上 —— 所以必须给用户一个开关，
+	// 让他在「命中率」与「等待时间」之间自己选。
+	AILyricsClean bool `json:"aiLyricsClean"`
+	// AIDownloadTag 下载歌曲时，是否让 AI 提取元数据并写回文件。
+	//
+	// 与 AILyricsClean 的区别：那个开关管的是「匹配歌词前要不要等 AI」，
+	// 发生在**用户盯着界面等**的路径上；这个管的是「下载完成后要不要顺手把
+	// 文件名里的信息还原成真正的标签」，发生在下载**已经结束之后**的后台，
+	// 用户不必等它 —— 所以它可以默认开启，但仍然必须能被关掉：
+	// 写标签会改写用户的音乐文件，这是不可撤销的操作。
+	AIDownloadTag bool `json:"aiDownloadTag"`
+	// AutoDownloadOnCollect 收藏 / 加入歌单时，是否把「只有试听缓存」的在线歌曲
+	// 自动下载一份到本地。
+	//
+	// 为什么需要它：在线歌曲的试听缓存是可丢弃的派生数据（清理、临时目录清空、
+	// 换机都会没），而「我喜欢」/ 歌单是用户明确的长期意图 —— 收藏了一首只能
+	// 在线试听的歌，等于收藏了一个随时会失效的引用。默认开启，把那份意图落成
+	// 真实文件；同时必须能被关掉，因为它会产生网络流量与磁盘占用。
+	AutoDownloadOnCollect bool `json:"autoDownloadOnCollect"`
+
+	Folders     []Folder     `json:"folders"`
+	FilterRules []FilterRule `json:"filterRules"`
+	LikedIDs    []string     `json:"likedIds"`
+	Playlists   []Playlist   `json:"playlists"`
+
+	// UnplayableFiles 是「播放时确认放不出来」的文件清单（见 services_unplayable.go）。
+	//
+	// 为什么落盘而不是只放内存：这些结论是**付过代价**才得到的 ——
+	// 每一条都意味着用户真的点过那首歌、等过一次失败。重启就丢的话，
+	// 用户下次还会踩同一个坑，而我们又要重新付一次代价。
+	//
+	// 为什么放在配置里而不是走曲库 IPC：曲库接口是「每首歌几十字节」的
+	// 高频大载荷（10 万首时每次 scan:done 都是几 MB），而失败原因是一段
+	// 可能上百字符的错误文本，塞进去会显著放大那个载荷。清单本身通常只有
+	// 几条，放配置里最合适。
+	UnplayableFiles []UnplayableFile `json:"unplayableFiles,omitempty"`
+
+	CacheDir string `json:"cacheDir"`
+
+	// 运行时字段，不落盘
+	ConfigPath string `json:"-"`
+	DataDir    string `json:"-"`
+}
+
+// UnplayableFile 一个「放不出来」的文件记录。
+//
+// 它记录的是**播放时实测失败**的事实，不是扫描时的猜测 —— 见
+// services_unplayable.go 顶部关于「为什么不在扫描时校验」的说明。
+type UnplayableFile struct {
+	SongID string `json:"songId"`
+	Path   string `json:"path"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Ext    string `json:"ext"`
+	// Reason 是失败原因原文（例如「转码失败: exit status 69…」
+	// 或「格式无法播放（解码失败）」），直接展示给用户。
+	Reason string `json:"reason"`
+	// At 是最近一次失败的时间（毫秒时间戳）
+	At int64 `json:"at"`
+	// Attempts 这首歌累计失败了几次。
+	// 大于 1 说明用户反复点过它（或者自动跳转踩到过多次），
+	// 可以用来判断「是不是该把它彻底忽略」。
+	Attempts int `json:"attempts"`
+}
+
+/* --------------------------------------------------------------------------
+   主窗口圆角
+   -------------------------------------------------------------------------- */
+
+// WindowCornerModes 主窗口圆角可选值。
+//
+// 为什么只有四档、没有「连续半径」：圆角是 DWM 画的，系统只给了
+// DWMWA_WINDOW_CORNER_PREFERENCE 这一个开关（默认 / 圆角 / 小圆角 / 直角）。
+// 想要任意像素的半径就得放弃系统外框（阴影 + 抗锯齿圆角）自己画，
+// 那是另一个量级的改动，这里不碰。
+var WindowCornerModes = []string{"system", "round", "small", "square"}
+
+// NormalizeWindowCorners 规范化圆角值：大小写/空格无关，非法值落回 system。
+func NormalizeWindowCorners(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	for _, m := range WindowCornerModes {
+		if m == mode {
+			return mode
+		}
+	}
+	return "system"
+}
+
+/* --------------------------------------------------------------------------
+   默认值
+   -------------------------------------------------------------------------- */
+
+// DefaultConfig 返回内置默认配置
+func DefaultConfig() *Config {
+	dataDir := defaultDataDir()
+	return &Config{
+		Theme:           "flat-dark",
+		ThemeMode:       "dark",
+		GlassBlur:       22,
+		GlassAlpha:      62,
+		WindowCorners:   "system",
+		Animations:      true,
+		AnimationsSpeed: "fast",
+		// 播放界面背景动效默认「流畅优先」：跟随显示刷新率。
+		// 高刷屏用户最容易感知到的就是不够流畅，而省电档随时可以自己切。
+		SkinPerformanceMode: "smooth",
+		ShowAlbumColumn:     true,
+		ShowLyrics:          true,
+		PlayMode:            "sequence",
+		Volume:              0.8,
+		PlayerViewMode:      "classic",
+		AutoScanOnStart:     true,
+		WatchFolders:        true,
+		ScanConcurrency:     4,
+		LyricsFontSize:      16,
+		LyricsLines:         7,
+		// 歌词来源优先级：内嵌 → 同目录 .lrc → 本程序缓存 → 在线自动匹配。
+		// 与 internal/lyrics.DefaultSources 保持一致；normalize() 会补齐缺项，
+		// 因此从旧版本升级上来的配置也能拿到 cache 这一层。
+		LyricsSources: []string{"embedded", "lrc-file", "cache", "online"},
+		Folders:       []Folder{},
+		FilterRules: []FilterRule{
+			{ID: "rule_size", Type: "size", Op: "lt", Value: "10240", Unit: "B", Scope: "exclude", Enabled: true},
+			{ID: "rule_mp4", Type: "regex", Op: "match", Value: `\.mp4$`, Scope: "exclude", Enabled: true},
+		},
+		LikedIDs:  []string{},
+		Playlists: []Playlist{},
+		DataDir:   dataDir,
+		CacheDir:  filepath.Join(dataDir, "cache"),
+
+		LoudnessMode:   "off",
+		LoudnessTarget: -16,
+		LoudnessLimit:  true,
+
+		DownloadDir: DefaultDownloadDir(),
+		OnlineCover: true,
+		// 默认开启：与加入这个开关之前的行为一致（能拿到逐字歌词就播逐字）。
+		OnlineWordLyrics: true,
+		EmbedMeta:        false,
+
+		// 默认「单击 = 播放」：单击一首歌就播它是绝大多数播放器的心智模型，
+		// 双击仍固定为「立即播放这一首」，
+		// 想排队的人可以在设置里改回「下一首播放」。
+		RowClickAction: "play",
+		// 默认开启：与加入这个开关之前「回到上次那首歌」的体验一致，
+		// 只是把播放位置也一并恢复；不想要可以在设置里关掉。
+		ResumeProgress: true,
+		// 默认记住音量：与加入这个开关之前的行为一致，关掉即每次回到默认音量。
+		RememberVolume: true,
+		ListDensity:    "cozy",
+		// 默认最小化到托盘：关闭按钮的意图通常是「先收起来」而不是「退出」，
+		// 而托盘图标由这个开关创建（见 main.go 的 WindowClosing 钩子）。
+		// 想直接退出的人在设置里关掉它即可。
+		MinimizeToTray: true,
+
+		ShowDesktopLyrics: false,
+		DesktopLyricsX:    DesktopLyricsNoPos,
+		DesktopLyricsY:    DesktopLyricsNoPos,
+		// 主窗口几何：全部为「没存过」，首次启动走 main.go 里写死的默认尺寸 + 居中。
+		// 不做「首次启动就按主屏算一个尺寸」这种「聪明」处理 —— 那和 Wails 的
+		// WindowCentered 行为不一致，反而会让首次启动的观感和以前不同。
+		MainWindowX:          MainWindowNoPos,
+		MainWindowY:          MainWindowNoPos,
+		MainWindowW:          0,
+		MainWindowH:          0,
+		MainWindowMaximized:  false,
+		ShowDesktopWallpaper: false,
+		// 默认开启：与加入这个开关之前的行为一致（上次开着的话，启动时自动恢复）。
+		// 关掉它之后，本次仍可手动打开背景歌词，只是重启后不再自动出现。
+		AutoStartDesktopWallpaper: true,
+		SleepAfterSong:            false,
+		ShuffleMode:               "reshuffle",
+
+		// 跳过静音默认**开启**（首尾都跳）：这两段空白本身就是「没有内容的时间」，
+		// 用户的实际听感是「点了播放却迟迟不出声」与「播完了还要白等十几秒」。
+		// 跳过的只是**会被播放的区间**，时长与进度条仍在原曲时间轴上
+		//（见 docs/38），所以它不像响度均衡 / 音效那样会改变用户听到的声音内容。
+		// 想「听完尾奏再切歌」的人在设置里关掉对应开关即可。
+		SkipSilenceHead: true,
+		SkipSilenceTail: true,
+		// 切歌间隔默认 1 秒：自动切歌时留一点呼吸感，也让「上一首结束」
+		// 与「下一首开始」在听感上分得开，而不是硬接在一起。
+		TrackGapSeconds: DefaultTrackGapSeconds,
+
+		// 音效默认关闭：与「响度均衡」「跳过静音」同一立场 ——
+		// 任何改动音频本身的处理都必须由用户明确开启。
+		EffectPreset: "off",
+
+		// 版本更新：启动时静默检查一次；下载通道默认 auto（直连优先，
+		// 失败自动换代理）；没有跳过的版本。
+		UpdateCheckOnStart: true,
+		UpdateChannel:      "auto",
+		SkippedVersion:     "",
+
+		// 插件仓库默认指向项目仓库的 plugins 目录（见 DefaultPackSource）
+		PackSource: DefaultPackSource,
+
+		// 封面轮播默认关闭：多封面时才会有意义，用户明确打开才动
+		CoverCarousel:         false,
+		CoverCarouselInterval: 10,
+
+		AIBaseURL:  "",
+		AIAPIKey:   "",
+		AIThinking: false,
+		AIModelID:  "",
+		// 默认自动识别；识别不出按 OpenAI 兼容处理
+		AIVendor: "auto",
+		// 默认开启：配置了 AI 的用户，自动匹配歌词时会先清洗元数据，
+		// 与加入这个开关之前的行为一致（关掉即回到「只用本地整形」）。
+		AILyricsClean: true,
+		// 默认开启：下载完成后在后台用 AI 整理元数据并写回文件。
+		// 它不占用用户任何等待时间（下载已经结束），而下载来的文件通常
+		// 标题就是 B 站视频标题、歌手/专辑全空 —— 不整理等于全程脏数据。
+		AIDownloadTag: true,
+		// 默认开启：把「只有试听缓存」的在线歌曲收进「我喜欢」/ 歌单时，
+		// 自动下载一份到本地。收藏是长期意图，试听缓存却是可丢弃的派生数据；
+		// 不这么做的话，收藏夹里会混进一批「过几天就打不开」的歌。
+		AutoDownloadOnCollect: true,
+	}
+}
+
+// CarouselIntervalBounds 轮播间隔的合法范围（秒）
+const (
+	MinCarouselInterval = 2
+	MaxCarouselInterval = 300
+)
+
+// NormalizeCarouselInterval 把轮播间隔夹到 [2, 300] 秒，非法值落回 10 秒。
+// 下限 2 秒是因为更快的轮播只会变成闪烁；上限 300 秒与定时停止的滑条量程一致。
+func NormalizeCarouselInterval(seconds int) int {
+	if seconds <= 0 {
+		return 10
+	}
+	if seconds < MinCarouselInterval {
+		return MinCarouselInterval
+	}
+	if seconds > MaxCarouselInterval {
+		return MaxCarouselInterval
+	}
+	return seconds
+}
+
+// RowClickActions 单击歌曲行的可选行为
+var RowClickActions = []string{"play", "play-list", "next"}
+
+// NormalizeRowClickAction 规范化单击行为，非法值落回 play（默认值，见 DefaultConfig）
+func NormalizeRowClickAction(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, ok := range RowClickActions {
+		if ok == v {
+			return v
+		}
+	}
+	return "play"
+}
+
+/* --------------------------------------------------------------------------
+   切歌间隔
+   -------------------------------------------------------------------------- */
+
+// DefaultTrackGapSeconds 是「两首歌之间间隔」的默认值（秒）。
+//
+// 1 秒：短到不至于让用户觉得播放器卡住，长到能把两首歌分得开。
+// 前端 store.js 的 DEFAULT_CONFIG 与设置界面滑块都以这个常量为准。
+const DefaultTrackGapSeconds = 1.0
+
+// 切歌间隔的合法范围（秒）。
+//
+// 上限 10 秒：再长的「间隔」已经不是间隔而是暂停了，用户想要的是定时停止
+// （见 SleepAfterSong），不该用这个滑块去凑。
+const (
+	MinTrackGapSeconds = 0.0
+	MaxTrackGapSeconds = 10.0
+)
+
+// NormalizeTrackGapSeconds 把切歌间隔夹到 [0, 10] 秒。
+//
+// 0 是**合法值**（表示「不留间隔，播完立刻接上」），所以不能用 <=0 落回默认 ——
+// 那会让用户明确选的「不间隔」被静默改成 1.5 秒。
+// 负数是非法输入（手改配置 / 旧版本），统一按 0 处理。
+func NormalizeTrackGapSeconds(seconds float64) float64 {
+	if seconds < MinTrackGapSeconds {
+		return MinTrackGapSeconds
+	}
+	if seconds > MaxTrackGapSeconds {
+		return MaxTrackGapSeconds
+	}
+	// 保留一位小数：设置界面的滑块是 0.1 秒一档，多余的精度只会让
+	// config.json 里出现 1.5000000000000002 这种值。
+	return float64(int(seconds*10+0.5)) / 10
+}
+
+// EffectPresets 是全部合法的音效档位。
+//
+// ★ 这里刻意**再写一遍**而不是从 internal/audioplay 导入：
+// bootstrap 是最底层的配置包，让配置层依赖一个业务包会把依赖方向弄反
+// （同样的理由见上面 UpdateChannel 的注释）。
+//
+// 两边的一致性由测试守住（见 config_effect_test.go）：
+// 它会比对这里的列表与 audioplay.EffectPresets 是否完全相同 ——
+// 那样既能保持依赖方向，又不会出现"后端认 4 个档、配置层只认 3 个"
+// 这种很难发现的不一致。
+//
+// ★ 曾经的 "live"（现场感）与 "hall"（大厅混响）两个混响档位已按用户
+// 要求整体移除。老配置里的这两个值会被 NormalizeEffectPreset 收敛成
+// "off"（而不是报错）—— 这正是该函数"非法值落回 off"语义要覆盖的场景。
+var EffectPresets = []string{"off", "vocal", "bass", "surround"}
+
+// NormalizeEffectPreset 把音效档位收敛到合法值，非法值落回 off。
+//
+// 手改配置、从旧版本升上来、前端传了个已删除的档位名 —— 都会走到这里。
+// 返回 off 而不是报错：音效是"锦上添花"的功能，为一个非法字符串
+// 让播放失败是本末倒置。
+func NormalizeEffectPreset(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, ok := range EffectPresets {
+		if v == ok {
+			return v
+		}
+	}
+	return "off"
+}
+
+// ListDensities 列表密度可选值
+var ListDensities = []string{"compact", "cozy", "roomy"}
+
+// AnimationsSpeeds 界面过渡速度可选值（与前端 settings.js 的分段控件一一对应）。
+// 默认 fast = 0.2s；medium / slow 分别是 0.35s / 0.5s。
+var AnimationsSpeeds = []string{"fast", "medium", "slow"}
+
+// NormalizeAnimationsSpeed 规范化过渡速度，非法值落回 fast（与历史默认 200ms 一致）。
+func NormalizeAnimationsSpeed(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, ok := range AnimationsSpeeds {
+		if ok == v {
+			return v
+		}
+	}
+	return "fast"
+}
+
+// SkinPerformanceModes 播放界面背景动效的帧率档位可选值。
+//   - smooth      流畅优先：背景动画跟随显示刷新率（120Hz 屏跑满 120fps）
+//   - performance 性能优先：播放 45fps / 空闲 22fps / 暂停 6 秒后完全停帧
+//
+// 注意作用域：**只影响播放详情页里由皮肤绘制的背景动画（canvas / rAF）**。
+// 设置界面、曲库列表等界面不挂皮肤、没有 rAF 循环，天然满帧，与此开关无关。
+var SkinPerformanceModes = []string{"smooth", "performance"}
+
+// NormalizeSkinPerformanceMode 规范化背景动效档位，非法值落回 smooth。
+//
+// 为什么兜底是 smooth 而不是 performance：这是「流畅度」开关，一个拼错的
+// 值如果落回省电档，用户看到的就是「我明明没开省电，怎么还是卡」——
+// 这类静默降级最难排查。落回流畅档至少不会让人误以为程序坏了。
+func NormalizeSkinPerformanceMode(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, ok := range SkinPerformanceModes {
+		if ok == v {
+			return v
+		}
+	}
+	return "smooth"
+}
+
+// normalizeLyricsSources 规范化歌词来源优先级。
+//
+// 复用 internal/lyrics 里的同一份实现：设置界面展示的顺序、读取时真正用的顺序
+// 必须是同一个真相，所以不能各写一遍。
+func normalizeLyricsSources(sources []string) []string {
+	return lyrics.NormalizeSources(sources)
+}
+
+// NormalizeListDensity 规范化列表密度，非法值落回 cozy
+func NormalizeListDensity(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, ok := range ListDensities {
+		if ok == v {
+			return v
+		}
+	}
+	return "cozy"
+}
+
+// UpdateChannels 是更新下载通道的合法值（"auto" 表示自动逐个尝试）。
+//
+// 这份列表必须与 internal/update.Mirrors 里的 id 保持一致。
+// 之所以在配置层再列一遍，是为了不让最底层的 bootstrap 包反向依赖
+// 业务包；两者不一致时不会静默出错 —— update 包会把认不出来的通道
+// 当成 auto 处理，最坏结果只是「用户的选择没生效」，不会下载失败。
+var UpdateChannels = []string{
+	"auto",
+	"direct",
+	"ghproxy.net",
+	"ghfast.top",
+	"githubproxy.cc",
+	"gh-proxy.com",
+	"ghproxy.homeboyc.cn",
+	"gh.llkk.cc",
+	"ghp.ci",
+}
+
+// NormalizeUpdateChannel 规范化更新下载通道，非法值落回 auto。
+func NormalizeUpdateChannel(v string) string {
+	v = strings.TrimSpace(v)
+	for _, ok := range UpdateChannels {
+		if ok == v {
+			return v
+		}
+	}
+	return "auto"
+}
+
+// DefaultPackSource 是「从仓库获取主题 / 样式包」的默认插件目录地址。
+//
+// 与 services_update.go 的 repoSlug 指的是同一个仓库（本项目的 GitHub 仓库），
+// 但两处不能合并成一个常量：repoSlug 是 "owner/name" 给 Release API 用的，
+// 这里是**静态文件**的基地址，走的域名、分支、路径都不一样。仓库改名时两处都要改。
+const DefaultPackSource = "https://raw.githubusercontent.com/nihaozyj7/localMusicPlayer/main/plugins"
+
+// NormalizePackSource 规范化插件仓库地址。
+//
+// 这里刻意做了一点「猜测」而不是直接拒绝非法值：用户手敲地址时最常见的两个错
+// 是漏了协议（github.com/x/y）和末尾多一条斜杠，两种都直接修好。
+// 真正修不了的（空、非 http(s) 协议、**明文 http 指向外部主机**）落回默认值
+// —— 让整个功能因为一个手滑的地址而静默失效，显然比用回默认值更糟。
+//
+// ★ 为什么明文 http 必须落回默认值（审查报告第 41 条）：
+// 这个地址取回的是 `index.json` + 一个个 **JS 文件**，装完之后在同源页面里
+// 执行（见 docs/42 §8.4 的安全说明）。明文链路能被任何一跳改写，等于把
+// 「在同源页面执行任意 JS」的权力交给了链路上的中间人 —— 而 sha256 是随清单
+// 一起送来的（自证），挡不住这种替换。http 只放行本机回环（本地调试自己起
+// 静态服务器），与 AI 接口地址同一套判据（见 parseSecureEndpoint）。
+//
+// 地址被拒时**不会**静默：`PackSourceProblem` 会给出原因，面板上显示出来。
+func NormalizePackSource(v string) string {
+	clean := strings.TrimSpace(v)
+	if clean == "" {
+		return DefaultPackSource
+	}
+	if !strings.Contains(clean, "://") {
+		clean = "https://" + clean
+	}
+	clean = strings.TrimRight(clean, "/")
+	if _, err := parseSecureEndpoint(clean); err != nil {
+		return DefaultPackSource
+	}
+	return clean
+}
+
+// PackSourceProblem 返回「用户填的插件仓库地址不会被使用」的原因；地址可用
+// （或为空 = 用默认地址）时返回空串。
+//
+// 为什么要单独给一个原因：NormalizePackSource 会把非法地址**落回默认值**，
+// 于是用户看到的现象是「我改了地址，刷新一下又变回默认了」—— 必须把原因
+// 说出来，否则他会以为是自己没保存成功。出错信息不回显地址本身。
+func PackSourceProblem(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return ""
+	}
+	if _, err := parseSecureEndpoint(trimmed); err != nil {
+		return "这个地址不会被使用（已落回默认地址）：必须是 https://，明文 http 只允许 127.0.0.1 / localhost 做本地调试"
+	}
+	return ""
+}
+
+// NormalizeAIBaseURL 规范化并校验「AI 接口地址」。
+//
+// 返回规范化后的地址（漏协议时补 `https://`、去掉末尾斜杠）；err != nil 表示
+// 这个地址**不允许使用**。
+//
+// ★ 调用方**不要因为 err 就把用户输入丢掉**（那会变成「改了设置、一刷新就没了」，
+// 用户还不知道为什么）。正确做法：照原样存下来（见 NormalizeAIBaseURLStored），
+// 在真正要发请求的那一处拒绝（`services_ai.go#ExtractMeta`），并让界面把原因显示出来。
+//
+// 为什么这里必须是硬校验，而不是「看着像 URL 就发」：这个地址指向的请求会带上
+// 用户**真实的 Bearer 密钥**（`services_ai.go` 的 Authorization 头），而地址本身
+// 来自用户配置 —— 第三方样式 JS（同源 import）也能写这个键。
+//
+// 规则：
+//
+//   - 只认 `https://`；明文 `http://` 仅放行本机回环（`127.0.0.1` / `[::1]` /
+//     `localhost`）—— 本机模型服务（LM Studio / Ollama）常这么配，且流量不出网卡；
+//   - 不允许用 IP 字面量指向非回环主机：证书没法验证，等于把 TLS 校验关掉；
+//   - 不允许 URL 里带用户名密码（会被当成主机的一部分、并进日志）；
+//   - 不允许带查询串与 `#` 锚点（拼 `+ "/chat/completions"` 时会拼坏）；
+//   - 出错信息只描述**规则**，绝不回显地址本身（地址里可能已经被塞了密钥）。
+func NormalizeAIBaseURL(v string) (string, error) {
+	raw := strings.TrimSpace(v)
+	if raw == "" {
+		// 空 = 未配置，不是错误（配没配由 Enabled() 判断）。
+		return "", nil
+	}
+	u, err := parseSecureEndpoint(raw)
+	if err != nil {
+		return "", err
+	}
+	// 去掉末尾斜杠：调用方按 base + "/chat/completions" 拼路径。
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawPath = ""
+	return u.String(), nil
+}
+
+// NormalizeAIBaseURLStored 供「读盘 / 写配置」路径使用：能规范化就规范化，
+// 非法值**原样保留**（只 trim）。分工见 NormalizeAIBaseURL 的文档注释 ——
+// 闸门在发请求那一处，这里只负责把能修好的地址修好。
+func NormalizeAIBaseURLStored(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if norm, err := NormalizeAIBaseURL(trimmed); err == nil {
+		return norm
+	}
+	return trimmed
+}
+
+// parseSecureEndpoint 解析一个「会拿它去取远端内容」的地址，并套用下面这套规则。
+//
+// 两处调用：AI 接口地址（NormalizeAIBaseURL，请求带真实密钥）与插件仓库地址
+// （NormalizePackSource，取回的 JS 会在同源页面执行）。两者的风险不同，但
+// 「什么地址算安全」的判据是同一套，所以**只有这一份实现** —— 各写一套必然会
+// 漂移，而漂移的代价就是某一边悄悄放行了明文 http。
+//
+// 错误信息只描述规则、不回显地址（调用方可能把密钥塞进查询串）。
+func parseSecureEndpoint(raw string) (*url.URL, error) {
+	v := raw
+	// 手敲地址最常见的错误就是漏协议，这里补一次（两处调用都用同一套猜测）。
+	if !strings.Contains(v, "://") {
+		v = "https://" + v
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return nil, errors.New("地址格式不正确")
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return nil, errors.New("地址必须用 https://（明文 http 只允许 127.0.0.1 / localhost，用于本地调试）")
+		}
+	default:
+		return nil, errors.New("地址只支持 http / https")
+	}
+	if u.Hostname() == "" {
+		return nil, errors.New("地址缺少主机名")
+	}
+	if u.User != nil {
+		return nil, errors.New("地址里不要写用户名密码")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("地址不要带查询串或 # 锚点")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && !ip.IsLoopback() {
+		return nil, errors.New("地址不要直接用 IP（证书没法验证），请填域名；本机服务用 127.0.0.1 或 localhost")
+	}
+	if !validEndpointHost(u.Hostname()) {
+		return nil, errors.New("地址的主机名不合法：请填带点的域名（例如 api.openai.com），本机服务用 127.0.0.1 或 localhost")
+	}
+	return u, nil
+}
+
+// validEndpointHost 判断主机名能不能作为「去远端取东西」的目标。
+//
+// 只有两类放行：本机回环，或**带点的 ASCII 域名**（IDN 请填 punycode 的
+// `xn--…` 形式）。这一条是被测试逼出来的：`NormalizeAIBaseURL("不是地址")`
+// 会先补成 `https://不是地址`，而 url.Parse 对非 ASCII 主机名照收不误
+// （只在 String() 时做百分号转义）—— 于是「根本不是地址的文本」也能通过校验。
+// 单标签主机名（`https://llm-gateway/v1`）同样拒绝：它靠 LLMNR / NBT-NS 这类
+// 可被局域网冒充的名字解析，等于把密钥交给「谁都可能是」的那台机器。
+func validEndpointHost(host string) bool {
+	if isLoopbackHost(host) {
+		return true
+	}
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if !strings.Contains(h, ".") || strings.HasPrefix(h, ".") {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		// 空标签（`a..b`）不是合法域名。
+		if label == "" {
+			return false
+		}
+	}
+	for _, r := range h {
+		isLower := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if !isLower && !isDigit && r != '.' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// isLoopbackHost 判断主机名是不是本机回环。
+//
+// `net.ParseIP(h).IsLoopback()` 已经覆盖 `127.0.0.0/8` 与 `::1`，这里额外认
+// `localhost` 与 `*.localhost`（保留域，系统解析到 127.0.0.1）。
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// DefaultDownloadDir 在线歌曲的默认下载目录：系统「音乐」目录下的 downloads。
+//
+// 放在音乐目录里是有意的：下载下来的本来就是音乐文件，用户后续想把它加进曲库
+// 只需要在选择文件夹时点一下「音乐」；而独立的 downloads 子目录又保证它
+// 不会和用户自己整理好的曲库混在一起。
+func DefaultDownloadDir() string {
+	music := systemMusicDir()
+	if music == "" {
+		// 拿不到系统音乐目录时退到数据目录，至少保证有地方可写
+		return filepath.Join(defaultDataDir(), "downloads")
+	}
+	return filepath.Join(music, "downloads")
+}
+
+// DownloadFolderID 下载目录作为扫描根时使用的固定 id。
+//
+// 它不出现在 config.Folders 里（用户在设置里看不到、也删不掉），
+// 而是由 EffectiveFolders 每次动态拼进来 —— 这样「下载目录」始终只有一个
+// 真相来源（DownloadDir），不会出现「改了下载路径但旧的还留在扫描列表里」。
+const DownloadFolderID = "auto_downloads"
+
+// EffectiveFolders 返回真正要扫描的文件夹列表 = 用户配置的文件夹 + 下载目录。
+//
+// 需求：「所有歌曲」要包含下载路径和用户要扫描的路径。下载目录由程序管理，
+// 所以不能要求用户手动添加；同时要避免与用户手动添加的目录重复
+// （用户完全可能把 Music 整个目录加进来，而下载目录就在它下面）。
+//
+// 用值接收者：调用点大多是 store.Get() 返回的临时副本（不可寻址）。
+func (c Config) EffectiveFolders() []Folder {
+	out := make([]Folder, 0, len(c.Folders)+1)
+
+	downloadDir := cleanAbsPath(c.DownloadDir)
+	downloadCovered := false
+	for _, f := range c.Folders {
+		// 下载目录是**派生**出来的，不该出现在用户配置里。早期版本把
+		// EffectiveFolders() 的结果整体写回了 config.Folders，于是留下了
+		// 形如 {"id":"auto_downloads","path":"<旧下载目录>"} 的残留：
+		// 改过下载位置之后旧目录会永远是扫描根，而且可能同时存在两条同 id
+		// 不同 path 的记录（folderStatuses 是 map[id]，状态会互相覆盖）。
+		// 这里直接忽略这种残留，下面按当前 DownloadDir 重新合成一条。
+		if f.ID == DownloadFolderID {
+			continue
+		}
+		path := cleanAbsPath(f.Path)
+		if path == "" {
+			continue
+		}
+		out = append(out, Folder{
+			ID:       f.ID,
+			Path:     f.Path,
+			Status:   f.Status,
+			Watching: f.Watching,
+		})
+		// 用户已经手动加了下载目录，或加了它的上级目录 → 不再重复添加
+		if downloadDir != "" && (sameOrParent(path, downloadDir)) {
+			downloadCovered = true
+		}
+	}
+	if downloadDir == "" || downloadCovered {
+		return out
+	}
+	out = append(out, Folder{
+		ID:       DownloadFolderID,
+		Path:     c.DownloadDir,
+		Status:   "ok",
+		Watching: false,
+	})
+	return out
+}
+
+func cleanAbsPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = p
+	}
+	return strings.ToLower(filepath.Clean(abs))
+}
+
+// sameOrParent 判断 parent 是否是 child 本身或它的上级目录。
+func sameOrParent(parent, child string) bool {
+	if parent == child {
+		return true
+	}
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(child, strings.TrimRight(parent, sep)+sep)
+}
+
+// systemMusicDir 返回系统「音乐」目录（Windows 走 shell 已知文件夹）。
+func systemMusicDir() string {
+	if dir := os.Getenv("LMPLAYER_MUSIC_DIR"); dir != "" {
+		return dir
+	}
+	switch runtime.GOOS {
+	case "windows":
+		// %USERPROFILE%\Music 是 Windows 的默认音乐库路径。
+		// 注册表里可以查到被用户改过的值，但读取注册表需要额外依赖，
+		// 而且绝大多数机器上就是 UserProfile\Music，这里直接拼。
+		if profile := os.Getenv("USERPROFILE"); profile != "" {
+			return filepath.Join(profile, "Music")
+		}
+		return ""
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			return ""
+		}
+		return filepath.Join(home, "Music")
+	default:
+		// Linux: XDG 用户目录规范
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, "Music")
+		}
+		return ""
+	}
+}
+
+func defaultDataDir() string {
+	if dir := os.Getenv("LMPLAYER_DATA_DIR"); dir != "" {
+		return dir
+	}
+	switch runtime.GOOS {
+	case "windows":
+		base := os.Getenv("APPDATA")
+		if base == "" {
+			base = os.Getenv("LOCALAPPDATA")
+		}
+		if base == "" {
+			base = "."
+		}
+		return filepath.Join(base, "LocalMusicPlayer")
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, "Library", "Application Support", "LocalMusicPlayer")
+	default:
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			return filepath.Join(xdg, "localmusicplayer")
+		}
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".config", "localmusicplayer")
+	}
+}
+
+// legacyDataDir 返回「改名之前」的数据目录：同名同层级，只把最后一段换成旧名字。
+// 认不出来（比如测试里用 LMPLAYER_DATA_DIR 指到临时目录）时返回空串。
+func legacyDataDir(newDir string) string {
+	switch filepath.Base(newDir) {
+	case "LocalMusicPlayer":
+		return filepath.Join(filepath.Dir(newDir), "MusicPlayer")
+	case "localmusicplayer":
+		return filepath.Join(filepath.Dir(newDir), "musicplayer")
+	}
+	return ""
+}
+
+// migrateLegacyDataDir 把旧版本用的数据目录整体改名到新名字。
+//
+// 背景：0.1.0 之前数据目录叫 MusicPlayer / musicplayer；改名之后如果不迁移，
+// 用户的设置、歌单、收藏、封面与歌词缓存会在升级后「全部消失」—— 文件其实
+// 还在磁盘上，只是程序不再看那个目录了。
+//
+// 只在「新目录不存在」且「旧目录存在」时迁移一次；任何一步失败都不致命，
+// 照常使用新目录（用户可以手动搬）。
+func migrateLegacyDataDir(newDir string) {
+	if newDir == "" {
+		return
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return // 新目录已经在用，旧的留着不动
+	}
+	legacy := legacyDataDir(newDir)
+	if legacy == "" {
+		return
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		return // 没有旧目录：全新安装
+	}
+	if err := os.Rename(legacy, newDir); err != nil {
+		log.Printf("[config] 旧数据目录迁移失败（将继续使用新目录）: %v", err)
+		return
+	}
+	log.Printf("[config] 已把数据目录从 %s 迁移到 %s", legacy, newDir)
+}
+
+// repairLegacyCacheDir 把「改名之前遗留的绝对 cacheDir」修正回新数据目录，并把旧内容补过来。
+//
+// # 为什么必须有这一步（实测到的「缓存莫名消失」）
+//
+// cacheDir 在 config.json 里是**绝对路径**。0.1.0 之前数据目录叫
+// %APPDATA%MusicPlayer，那时的配置记的就是 %APPDATA%MusicPlayercache。
+// 改名时 migrateLegacyDataDir 把整个数据目录 rename 成了 LocalMusicPlayer，
+// 但配置里那条绝对路径不会跟着改 —— 于是程序下一次启动又按老路径
+// **新建了一个空的** MusicPlayercache，之后匹配到的封面与歌词全部写进那里；
+// 而用户之前匹配好的封面/歌词仍然躺在 LocalMusicPlayercache 里，
+// 界面上却一张都读不到（封面 404、歌词「没了」）。
+//
+// 真实数据可以证明这条链：metadata-cache.json 引用了 41 张内嵌封面，
+// 其中 40 张在 LocalMusicPlayercachecovers、只有 1 张在 MusicPlayercachecovers，
+// 而当时的 cacheDir 正指着后者 —— 40 张封面全部 404。
+//
+// 处理策略：只要 cacheDir 落在旧数据目录**之内**，就按同样的相对位置映射到
+// 新数据目录，并把旧目录里缺失的文件补过去。不覆盖新目录里已有的文件
+// （那里的才是当前正在用的），旧目录一律保留 —— 删用户的文件不是这里该做的事。
+// 判据刻意收得很窄（必须在旧数据目录之内），所以用户手动把缓存指到 D:cache
+// 这类合法配置不会被误伤。
+func repairLegacyCacheDir(cfg *Config) {
+	if cfg.CacheDir == "" || cfg.DataDir == "" {
+		return
+	}
+	legacy := legacyDataDir(cfg.DataDir)
+	if legacy == "" {
+		return
+	}
+	rel, err := filepath.Rel(legacy, cfg.CacheDir)
+	if err != nil || rel == "." || rel == ".." {
+		return
+	}
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return // 不在旧数据目录之内，是用户自己设的位置
+	}
+	target := filepath.Join(cfg.DataDir, rel)
+	if filepath.Clean(target) == filepath.Clean(cfg.CacheDir) {
+		return
+	}
+	moved, skipped, err := mergeTree(cfg.CacheDir, target)
+	switch {
+	case err != nil:
+		log.Printf("[config] 旧缓存目录搬运失败（继续使用新目录 %s）: %v", target, err)
+	case moved > 0:
+		log.Printf("[config] 缓存目录指向旧数据目录，已改用 %s 并补入 %d 个文件（跳过 %d 个已存在）", target, moved, skipped)
+	default:
+		log.Printf("[config] 缓存目录指向旧数据目录，已改用 %s（旧目录无可补内容）", target)
+	}
+	cfg.CacheDir = target
+}
+
+// mergeTree 把 src 下的文件**补**到 dst：只写 dst 里不存在（或为空）的文件，
+// 目录按需创建。返回补入 / 跳过的文件数；src 不存在时视为「没什么可搬」。
+//
+// 之所以不用 os.Rename 整体搬：目标目录很可能已经有一个正在用的 metadata
+// 索引（index.json），整体 rename 会把当前状态盖掉。
+func mergeTree(src, dst string) (moved, skipped int, err error) {
+	if st, statErr := os.Stat(src); statErr != nil || !st.IsDir() {
+		return 0, 0, nil
+	}
+	err = filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil // 单个文件读不了不该让整次搬运失败
+		}
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if st, statErr := os.Stat(target); statErr == nil && st.Size() > 0 {
+			skipped++
+			return nil
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		if writeErr := atomicfile.Write(target, raw, 0o644); writeErr != nil {
+			return nil
+		}
+		moved++
+		return nil
+	})
+	return moved, skipped, err
+}
+
+/* --------------------------------------------------------------------------
+   读写
+   -------------------------------------------------------------------------- */
+
+// Store 配置存储，带读写锁
+type Store struct {
+	mu     sync.RWMutex
+	cfg    *Config
+	tmpSeq uint64 // 临时文件名序号，避免并发写互相覆盖
+}
+
+// NewStore 加载配置；文件不存在或损坏时落回默认值（不会覆盖坏文件，先备份）
+func NewStore() (*Store, error) {
+	cfg := DefaultConfig()
+	migrateLegacyDataDir(cfg.DataDir)
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("创建数据目录失败: %w", err)
+	}
+	cfg.ConfigPath = filepath.Join(cfg.DataDir, "config.json")
+
+	if raw, err := os.ReadFile(cfg.ConfigPath); err == nil {
+		parsed, before, dropped := decodeConfig(raw, cfg)
+		cfg = parsed
+		if len(dropped) > 0 || before != "" {
+			// 备份名带时间戳：旧实现固定叫 `.broken`，第二次损坏会把它覆盖掉，
+			// 而**第一次**的现场往往才是能看出「哪个键被谁写坏了」的那一份。
+			backup := cfg.ConfigPath + ".broken-" + time.Now().Format("20060102-150405")
+			_ = os.WriteFile(backup, raw, 0o644)
+			if before != "" {
+				fmt.Fprintf(os.Stderr, "[config] 解析失败，已备份到 %s：%v\n", backup, before)
+			} else {
+				fmt.Fprintf(os.Stderr, "[config] 有字段类型不对，已按默认值降级并备份到 %s：%v\n", backup, strings.Join(dropped, ", "))
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("读取配置失败: %w", err)
+	}
+
+	normalize(cfg)
+	s := &Store{cfg: cfg}
+	if err := s.Save(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// decodeConfig 把 config.json 解成一份配置。
+//
+// 正常路径就是一次普通的 json.Unmarshal；**只有整份解析失败时**才退到逐键降级。
+//
+// 为什么要降级（审查报告第 9 条）：旧实现里一个键的类型被写坏（实测只把
+// `volume` 写成字符串）就会让整份 unmarshal 失败 → 整份回到默认值 ——
+// 用户看到的是「我的歌单和收藏全没了」，而坏掉的其实只有一个音量字段。
+//
+// 逐键降级的做法：把每个键单独包成一个单键对象，再 Unmarshal 到同一份 out 上。
+// 于是「哪个键坏」只影响那一个键（回落默认值），其余键照常生效；而且不需要反射、
+// 也不需要维护一张「键 → 字段」的对照表（那种表迟早会和结构体漂移）。
+//
+// 返回：解析结果、整份解析的失败原因（没失败则为空串）、被丢掉（回落默认值）
+// 的键名（已排序）。**只记键名不记值** —— 配置里可能有密钥。
+func decodeConfig(raw []byte, base *Config) (*Config, string, []string) {
+	newBase := func() *Config {
+		out := DefaultConfig()
+		// DataDir / ConfigPath 是 json:"-" 的运行时事实，永远以调用方给的那份为准。
+		out.DataDir = base.DataDir
+		out.ConfigPath = base.ConfigPath
+		return out
+	}
+
+	out := newBase()
+	if err := json.Unmarshal(raw, out); err == nil {
+		return out, "", nil
+	} else {
+		wholeErr := err.Error()
+
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			// 连「键值对」都读不出来 = 文件整体不是 JSON 对象，只能整份回落默认值。
+			return newBase(), wholeErr, nil
+		}
+
+		// 从干净的默认值开始：坏键必须回到默认，而不是留着上一次解析的半份数据。
+		out = newBase()
+		var dropped []string
+		for key, val := range fields {
+			one, err := json.Marshal(map[string]json.RawMessage{key: val})
+			if err == nil {
+				err = json.Unmarshal(one, out)
+			}
+			if err != nil {
+				dropped = append(dropped, key)
+			}
+		}
+		sort.Strings(dropped)
+		return out, wholeErr, dropped
+	}
+}
+
+// normalize 补齐空值、规范化路径，保证前端拿到的字段总是可用的
+func normalize(cfg *Config) {
+	def := DefaultConfig()
+
+	if cfg.Theme == "" {
+		cfg.Theme = def.Theme
+	}
+	if cfg.ThemeMode == "" {
+		cfg.ThemeMode = def.ThemeMode
+	}
+	if cfg.GlassBlur <= 0 {
+		cfg.GlassBlur = def.GlassBlur
+	}
+	if cfg.GlassAlpha <= 0 {
+		cfg.GlassAlpha = def.GlassAlpha
+	}
+	// 圆角：认不出来就跟随系统
+	cfg.WindowCorners = NormalizeWindowCorners(cfg.WindowCorners)
+	if cfg.ScanConcurrency <= 0 {
+		cfg.ScanConcurrency = def.ScanConcurrency
+	}
+	if cfg.LyricsFontSize <= 0 {
+		cfg.LyricsFontSize = def.LyricsFontSize
+	}
+	if cfg.LyricsLines <= 0 {
+		cfg.LyricsLines = def.LyricsLines
+	}
+	if len(cfg.LyricsSources) == 0 {
+		cfg.LyricsSources = def.LyricsSources
+	} else {
+		cfg.LyricsSources = normalizeLyricsSources(cfg.LyricsSources)
+	}
+	if cfg.PlayMode == "" {
+		cfg.PlayMode = def.PlayMode
+	}
+	if cfg.PlayerViewMode == "" {
+		cfg.PlayerViewMode = def.PlayerViewMode
+	}
+	if cfg.Volume < 0 || cfg.Volume > 1 {
+		cfg.Volume = def.Volume
+	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = def.DataDir
+	}
+	if cfg.CacheDir == "" {
+		cfg.CacheDir = filepath.Join(cfg.DataDir, "cache")
+	}
+	// 改名遗留的绝对路径要在这里修正：不清掉的话，封面/歌词会被写到一个
+	// 用户根本不知道的空目录里（见 repairLegacyCacheDir 的说明）。
+	repairLegacyCacheDir(cfg)
+	if strings.TrimSpace(cfg.DownloadDir) == "" {
+		cfg.DownloadDir = DefaultDownloadDir()
+	}
+	cfg.RowClickAction = NormalizeRowClickAction(cfg.RowClickAction)
+	cfg.ListDensity = NormalizeListDensity(cfg.ListDensity)
+	// 切歌间隔：手改配置写成负数 / 超大值时收敛到合法范围。
+	// 注意 0 是合法值，NormalizeTrackGapSeconds 内部已经区分了「0」与「非法」。
+	cfg.TrackGapSeconds = NormalizeTrackGapSeconds(cfg.TrackGapSeconds)
+	// 音效档位：已删除的档位名 / 手改写成乱码一律落回 off，
+	// 否则前端拿到的值在分段控件里匹配不上任何按钮 —— 表现为
+	//「设置里一个音效都没选中，但声音确实是处理过的」，很难排查。
+	cfg.EffectPreset = NormalizeEffectPreset(cfg.EffectPreset)
+	cfg.AnimationsSpeed = NormalizeAnimationsSpeed(cfg.AnimationsSpeed)
+	cfg.SkinPerformanceMode = NormalizeSkinPerformanceMode(cfg.SkinPerformanceMode)
+	// 更新下载通道：手改成别的值（或者旧版本里存着一个已经下架的代理 id）
+	// 一律落回 auto —— 否则下载会拿着一个非法通道名去查表，
+	// 表现为「点下载没有任何反应」。
+	//
+	// 这里不导入 internal/update 来复用它的校验：bootstrap 是最底层的包，
+	// 让配置层依赖一个业务包会把依赖方向弄反。
+	cfg.UpdateChannel = NormalizeUpdateChannel(cfg.UpdateChannel)
+	// 插件仓库地址：手改配置写坏了也不该让「从仓库获取」整块失效
+	cfg.PackSource = NormalizePackSource(cfg.PackSource)
+	// AI 接口地址：只修「能修的」（漏协议、多尾斜杠）。非法值**原样留着**
+	// —— 悄悄清空它只会让 AI 功能莫名不可用；闸门在发请求那一处
+	//（services_ai.go#ExtractMeta），见 NormalizeAIBaseURL。
+	cfg.AIBaseURL = NormalizeAIBaseURLStored(cfg.AIBaseURL)
+	// 派生字段绝不允许落盘（它只在 ConfigService.Get 里按当前地址现算）。
+	cfg.AIBaseURLProblem = ""
+	if cfg.ShuffleMode != "once" {
+		cfg.ShuffleMode = "reshuffle"
+	}
+	// 响度均衡：模式与目标值都要收敛到合法范围，避免手改配置写坏后
+	// 前端拿到奇怪的值（例如 target=0 会让补偿算成 +16dB 的巨响）。
+	switch cfg.LoudnessMode {
+	case "off", "track", "album":
+	default:
+		cfg.LoudnessMode = def.LoudnessMode
+	}
+	if cfg.LoudnessTarget == 0 {
+		cfg.LoudnessTarget = def.LoudnessTarget
+	}
+	if cfg.LoudnessTarget > -5 {
+		cfg.LoudnessTarget = -5
+	}
+	if cfg.LoudnessTarget < -40 {
+		cfg.LoudnessTarget = -40
+	}
+	if cfg.Folders == nil {
+		cfg.Folders = []Folder{}
+	}
+	if cfg.Playlists == nil {
+		cfg.Playlists = []Playlist{}
+	}
+	if cfg.LikedIDs == nil {
+		cfg.LikedIDs = []string{}
+	}
+	if cfg.FilterRules == nil {
+		cfg.FilterRules = def.FilterRules
+	}
+
+	for i := range cfg.Folders {
+		cfg.Folders[i].Path = filepath.Clean(cfg.Folders[i].Path)
+		if cfg.Folders[i].Status == "" {
+			cfg.Folders[i].Status = "ok"
+		}
+	}
+	for i := range cfg.Playlists {
+		if cfg.Playlists[i].SongIDs == nil {
+			cfg.Playlists[i].SongIDs = []string{}
+		}
+	}
+
+	// 桌面歌词 / 桌面背景歌词是一组**单选**按钮。手改配置（或者从更早的版本
+	// 升上来）把它们同时写成 true 时，这里就地收敛成「以背景歌词为准」——
+	// 否则每次启动都会同时恢复两个消费资源的窗口，画面上还是两条歌词叠着。
+	if cfg.ShowDesktopWallpaper && cfg.ShowDesktopLyrics {
+		cfg.ShowDesktopLyrics = false
+	}
+}
+
+// StartupDesktopMode 返回「启动时应该自动恢复哪一个桌面模式」。
+//
+// 取值与 WindowService 的三个模式常量一一对应（off / lyrics / wallpaper），
+// 用字符串而不是两个 bool：这两种模式是一组单选，让配置层直接回答
+// 「启动该开哪个」比让调用方各自比较两个开关更不容易写错。
+//
+// ★ 为什么要看 AutoStartDesktopWallpaper：
+// 需求是「桌面背景歌词在启动时自动启用（如果用户已经启用），关闭后则桌面背景
+// 歌词只在本次启动生效」。也就是说 ShowDesktopWallpaper 这只表示**本次运行**
+// 开着，而不表示「下次启动也自动开」—— 后者由 AutoStartDesktopWallpaper 决定。
+// 只有两者同时为真，启动时才自动恢复背景歌词。
+//
+// 桌面歌词没有这个「仅本次」的语义：它的开关就是持久的，所以只看它自己。
+func (c Config) StartupDesktopMode() string {
+	switch {
+	case c.ShowDesktopWallpaper && c.AutoStartDesktopWallpaper:
+		return "wallpaper"
+	case c.ShowDesktopLyrics:
+		return "lyrics"
+	default:
+		return "off"
+	}
+}
+
+// DesktopLyricsNoPos 表示「桌面歌词还没有位置存档」。
+//
+// 用 -1 而不是 0：0 是完全合法的窗口坐标（副屏在主屏左侧时 X 为负，
+// 主屏左上角就是 0），拿 0 当哨兵会把「拖到左上角」误判成「没存过」。
+const DesktopLyricsNoPos = -1
+
+// DesktopLyricsPos 返回桌面歌词窗口的位置存档；ok=false 表示还没有存过。
+//
+// 把「有没有存过」和「坐标是多少」一起返回，调用方就不必各自记住
+// -1 这个哨兵值的语义（少一处就少一处写错的机会）。
+func (s *Store) DesktopLyricsPos() (int, int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	x, y := s.cfg.DesktopLyricsX, s.cfg.DesktopLyricsY
+	if x == DesktopLyricsNoPos && y == DesktopLyricsNoPos {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+// SetDesktopLyricsPos 记住桌面歌词窗口的位置。
+func (s *Store) SetDesktopLyricsPos(x, y int) error {
+	return s.Update(func(c *Config) {
+		c.DesktopLyricsX = x
+		c.DesktopLyricsY = y
+	})
+}
+
+// MainWindowNoPos 表示「主窗口还没有位置存档」（理由同 DesktopLyricsNoPos）。
+const MainWindowNoPos = -1
+
+// MainWindowGeometry 返回主窗口的几何存档。
+//
+// okPos=false 表示位置没存过（首次启动 → 交给 Wails 居中）；
+// okSize=false 表示尺寸没存过（首次启动 → 用 main.go 里的默认值）。
+//
+// 位置和尺寸分开返回，是因为两者可能只存下来一半：比如某个平台没发出 resize
+// 事件、或者用户只用过最大化。合成一个 ok 会让「有位置没尺寸」这种情况整个
+// 退回默认，白白丢掉已经记下来的位置。
+func (s *Store) MainWindowGeometry() (x, y, w, h int, okPos, okSize, maximized bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	x, y = s.cfg.MainWindowX, s.cfg.MainWindowY
+	w, h = s.cfg.MainWindowW, s.cfg.MainWindowH
+	okPos = !(x == MainWindowNoPos && y == MainWindowNoPos)
+	okSize = w > 0 && h > 0
+	maximized = s.cfg.MainWindowMaximized
+	return x, y, w, h, okPos, okSize, maximized
+}
+
+// SetMainWindowGeometry 记住主窗口的位置与尺寸。
+//
+// x/y 传 MainWindowNoPos 表示「这次不要更新位置」（例如只想知道尺寸变了），
+// w/h 传 0 表示「不要更新尺寸」—— 这样两条事件路径可以只写自己关心的那部分，
+// 不必互相覆盖。
+func (s *Store) SetMainWindowGeometry(x, y, w, h int) error {
+	return s.Update(func(c *Config) {
+		if !(x == MainWindowNoPos && y == MainWindowNoPos) {
+			c.MainWindowX = x
+			c.MainWindowY = y
+		}
+		if w > 0 && h > 0 {
+			c.MainWindowW = w
+			c.MainWindowH = h
+		}
+	})
+}
+
+// SetMainWindowMaximized 记住主窗口当前是不是最大化。
+func (s *Store) SetMainWindowMaximized(on bool) error {
+	return s.Update(func(c *Config) { c.MainWindowMaximized = on })
+}
+
+// ResetMainWindowGeometry 清掉主窗口几何存档（回默认尺寸 + 居中）。
+//
+// 与桌面歌词的「重置位置」同一用途：换显示器 / 改分辨率之后存档可能落在
+// 屏幕外，给用户一个不用删配置文件的出口。
+func (s *Store) ResetMainWindowGeometry() error {
+	return s.Update(func(c *Config) {
+		c.MainWindowX = MainWindowNoPos
+		c.MainWindowY = MainWindowNoPos
+		c.MainWindowW = 0
+		c.MainWindowH = 0
+		c.MainWindowMaximized = false
+	})
+}
+
+// Get 返回配置快照（浅拷贝外壳 + 深拷贝切片，避免调用方改到内部状态）
+func (s *Store) Get() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := *s.cfg
+	out.Folders = append([]Folder(nil), s.cfg.Folders...)
+	out.FilterRules = append([]FilterRule(nil), s.cfg.FilterRules...)
+	out.Playlists = make([]Playlist, len(s.cfg.Playlists))
+	for i, p := range s.cfg.Playlists {
+		p.SongIDs = append([]string(nil), p.SongIDs...)
+		out.Playlists[i] = p
+	}
+	out.LikedIDs = append([]string(nil), s.cfg.LikedIDs...)
+	out.LyricsSources = append([]string(nil), s.cfg.LyricsSources...)
+	return out
+}
+
+// Update 在写锁内修改配置并落盘
+func (s *Store) Update(fn func(cfg *Config)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s.cfg)
+	normalize(s.cfg)
+	return s.saveLocked()
+}
+
+// Save 落盘
+func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+func (s *Store) saveLocked() error {
+	// ★ 路径为空 = 没有落盘目标，必须**前置**报错。
+	//
+	// 历史故障（审查报告第 9 条）：Reset 用 DefaultConfig() 覆盖配置时把
+	// 运行时填好的 ConfigPath 一起清成了空串，之后的每一次设置改动都只写内存，
+	// 而失败信息是 `rename .3.tmp : The system cannot find the path specified`
+	// —— 既看不出根因，也很难联想到「恢复默认设置」那一步。
+	// 这里宁可停在这一句上，也不要写到某个「相对当前目录」的临时文件里去。
+	if s.cfg.ConfigPath == "" {
+		return errors.New("配置路径为空，无法落盘（DataDir / ConfigPath 没有被正确初始化）")
+	}
+
+	// 不用 MarshalIndent：配置文件里可能包含全部歌单的 songIds（大曲库下是
+	// 数万个字符串），缩进会明显放大序列化开销与文件体积，而这份文件是给程序
+	// 读写的（人类手改是次要场景，且 JSON 本身已经够可读）。
+	raw, err := json.Marshal(s.cfg)
+	if err != nil {
+		return fmt.Errorf("序列化配置失败: %w", err)
+	}
+
+	// 用带序号的临时文件：即使上一次写入残留了 .tmp，也不会互相覆盖
+	tmp := fmt.Sprintf("%s.%d.tmp", s.cfg.ConfigPath, atomic.AddUint64(&s.tmpSeq, 1))
+
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return fmt.Errorf("写入配置失败: %w", err)
+	}
+
+	// Windows 上 os.Rename 覆盖已存在文件时，若目标正被杀毒软件 / 索引器
+	// 或另一个写者短暂占用，会返回 ERROR_SHARING_VIOLATION。
+	// 这里做几次退避重试，避免「扫描回写文件夹状态」这种后台写入偶发失败。
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := os.Rename(tmp, s.cfg.ConfigPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Duration(5*(attempt+1)) * time.Millisecond)
+	}
+
+	// 兜底：直接覆盖写入。会有极短的「非原子」窗口，但比整个操作失败更可取。
+	if err := os.WriteFile(s.cfg.ConfigPath, raw, 0o644); err == nil {
+		_ = os.Remove(tmp)
+		return nil
+	}
+
+	_ = os.Remove(tmp)
+	return fmt.Errorf("替换配置失败: %w", lastErr)
+}
+
+// Path 返回配置文件路径
+func (s *Store) Path() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.ConfigPath
+}
+
+// DataDir 返回数据目录
+func (s *Store) DataDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.DataDir
+}
+
+// Playlist 按 id 取歌单
+func (s *Store) Playlist(id string) (Playlist, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.cfg.Playlists {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return Playlist{}, false
+}
+
+// envRefPattern 匹配三种环境变量引用写法：`%NAME%`（Windows 习惯）、
+// `${NAME}` 与 `$NAME`（os.ExpandEnv 的语法）。
+var envRefPattern = regexp.MustCompile(
+	`%([A-Za-z_][A-Za-z0-9_]*)%|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+
+// expandEnv 一次扫描完成三种写法的展开。
+//
+// 两点刻意与 os.ExpandEnv 不同：
+//   - **展开结果不再二次扫描**：`%VAR%` 的值里含 `$` 时不能被再吃一遍
+//     （否则 `D:\a$b` 会变成 `D:\a`，见 TestExpandPathPercentEnvNotReExpanded）；
+//   - **变量不存在时原样保留**：路径里的 `%` / `$` 未必是变量引用
+//     （`D:\100% 无损`），os.ExpandEnv 会把认不出的 `$VAR` 直接删成空串。
+func expandEnv(p string) string {
+	if !strings.ContainsAny(p, "%$") {
+		return p
+	}
+	return envRefPattern.ReplaceAllStringFunc(p, func(m string) string {
+		var name string
+		switch {
+		case strings.HasPrefix(m, "%"):
+			name = m[1 : len(m)-1]
+		case strings.HasPrefix(m, "${"):
+			name = m[2 : len(m)-1]
+		default:
+			name = m[1:]
+		}
+		if v, ok := os.LookupEnv(name); ok {
+			return v
+		}
+		return m
+	})
+}
+
+// ExpandPath 展开用户输入的路径写法，返回可直接使用的路径：
+//
+//   - 前后空白与 `.` / `..` / 重复分隔符会被清理（filepath.Clean）；
+//   - `~` / `~/x` → 当前用户主目录；
+//   - `%VAR%`（Windows 习惯写法）与 `$VAR` / `${VAR}` → 环境变量。
+//
+// ★ 这里原本只有一句「展开 %VAR% 与 ~」，而实现里只有 os.ExpandEnv —— 它**只认
+// `$VAR`**。这处「注释与实现不符」的代价落在用户身上：Windows 用户把
+// `%USERPROFILE%\Music\downloads` 粘进「下载位置」会原样留下 `%…%`，变成一个
+// 不存在的相对路径（文件夹显示为找不到），而注释还写着这个写法是支持的。
+// 现在两种写法都认（第六轮审查 §4.2）。
+//
+// 展开顺序：先环境变量，再 `~`（这样 `~/$X` 也能正确拼出主目录下的路径）。
+func ExpandPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return p
+	}
+	p = expandEnv(p)
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(p, "~"), string(os.PathSeparator)))
+		}
+	}
+	return filepath.Clean(p)
+}

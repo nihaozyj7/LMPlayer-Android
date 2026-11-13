@@ -1,0 +1,37 @@
+# --- Android / Gradle ---
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# --- Go 构建产物 ---
+go/**/*.so
+go/**/*.dll
+go/**/*.exe
+
+# --- 本地开发素材（截图、测试音频，不入库）---
+.shots/
+.testaudio/
+
+# --- AI 编码助手的工作记忆，与项目本身无关 ---
+MEMORY.md
+
+# --- Node / 工具 ---
+tools/node_modules/
+node_modules/
+__pycache__/
+*.pyc
+
+# --- 编辑器 / 系统 ---
+.idea/
+*.iml
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
+android/app/libs/_x/ 

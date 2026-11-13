@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="flat-dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob: file:; media-src 'self' blob: file:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <!--
+      ★ CSP 的两条硬规矩（第六轮审查 §2.5，别改回去）：
+
+      1. connect-src 里**不许**再出现裸 `ws:`。裸方案名 = 允许连任意目标的
+         WebSocket（ws://evil.example 也放行），而同源页面里跑着第三方样式包
+         的 JS —— 在 fetch/img 都被锁死的情况下，它是唯一的数据外发通道。
+         同一源的 WebSocket 由 `'self'` 覆盖（CSP3 明确："'self'" 对
+         ws:/wss: 按同主机同端口匹配），所以 Vite 的 HMR 在开发期照样连得上。
+      2. object-src / base-uri / form-action 三件套补齐：本应用不加载任何插件
+         对象、不靠 <base> 解析相对地址、也没有表单要提交。
+      另：frame-ancestors 故意**不写在这里** —— 它只对
+      「随文档一起下发的响应头」生效，写在 <meta> 里会被浏览器直接忽略
+      （控制台会报 "ignored when delivered via a <meta> element"）。
+      由 Go 侧给 HTML 响应加响应头，见 main.go 的 assets 中间件。
+    -->
+    <!--
+      注意：img-src 只有 'self' —— 在线封面**不能**直接写第三方地址，
+      必须走后端代理（/online/cover?...，见 services_online.go）。
+      代理出来的地址与页面同源，既满足 CSP，也顺手解决了图床校验 Referer 的问题。
+    -->
+    <title>LMPlayer</title>
+    <!--
+      首帧主题（同步阻塞脚本，必须放在样式表前面）：
+      主题本来是由 JS 在启动时套用的，而在 JS 跑起来之前页面用的是根元素上
+      写死的 data-theme="flat-dark"（近黑）。于是浅色主题会「先黑再白」，
+      封面取色主题会「先黑 → 再占位灰 → 再取色重绘」。
+      这个脚本由 Go 侧按磁盘上的真实配置即时生成（见 early_theme.go）：
+      它把 data-theme / data-mode / --seed / --seed-2 直接写在 <html> 上，
+      首帧就是对的颜色。外链而非内联是为了不放开 CSP 的 'unsafe-inline'。
+      浏览器预览（没有 Go 后端）下它 404，脚本不会执行，行为与以前完全一致。
+    -->
+    <script src="/early-theme.js"></script>
+
+    <!--
+      运行时样式表（空即可）：
+      主题切换、毛玻璃强度、用户自定义主题都通过 CSSOM 往这两个 <style> 里 insertRule。
+      预置在 HTML 里而不是用 JS 创建，可以避免被 CSP 判为「动态内联样式」。
+    -->
+    <style id="runtime-tokens"></style>
+    <style id="swatch-styles"></style>
+    <!--
+      启动过渡画面（#boot-splash）的样式。
+      刻意内联在 <head> 里、而不是放进 styles/*.css：
+        · 它必须在外链样式表之后「立刻」生效，不能等任何一次额外请求；
+        · 这一段只服务首帧，与主题令牌体系无关，放在这里不会污染主题。
+      CSP 的 style-src 本来就允许 unsafe-inline（见上面的 meta）。
+    -->
+    <style id="boot-splash-style">
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        /* 缓存图还没解码出来时先铺主题底色，避免闪一下白 */
+        background: var(--bg-window, #0b0c12);
+        opacity: 1;
+        transition: opacity 0.22s ease;
+        /* 过渡画面只负责好看：不吃鼠标事件（拖动 / 点击照常落到窗口上） */
+        pointer-events: none;
+      }
+      #boot-splash[data-hide] {
+        opacity: 0;
+      }
+      /* 缓存图默认**不可见**：它有可能 404（首次启动 / 非 Windows / 浏览器预览），
+         而浏览器对加载失败的 <img> 会画一个「碎图标」—— 那正是用户看到的那张破图。
+         只有确认真的加载出来了（data-hasframe，见 js/main.js）才显示。
+         用 opacity 而不是 display:none，是为了保证图片一定会被请求与解码。 */
+      #boot-splash__frame {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        /* 窗口尺寸 / DPI 与上次不同也能铺满：多出来的部分裁掉即可 */
+        object-fit: cover;
+        object-position: top left;
+        opacity: 0;
+      }
+      #boot-splash[data-hasframe] #boot-splash__frame {
+        opacity: 1;
+      }
+      /* 加载动画：默认形态（还没有缓存图 / 还没确认能显示） */
+      #boot-splash__mark {
+        position: relative;
+        display: flex;
+        width: 72px;
+        height: 72px;
+        align-items: center;
+        justify-content: center;
+      }
+      #boot-splash[data-hasframe] #boot-splash__mark {
+        display: none;
+      }
+      #boot-splash__mark svg {
+        width: 27px;
+        height: 27px;
+        color: var(--text-2, rgba(244, 244, 246, 0.66));
+      }
+      /* 转圈的那一圈：用 ::after 画，省一个 DOM 节点 */
+      #boot-splash__mark::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        border: 2px solid var(--accent-weak, rgba(255, 255, 255, 0.14));
+        border-top-color: var(--accent, #ffffff);
+        animation: boot-splash-spin 0.9s linear infinite;
+      }
+      @keyframes boot-splash-spin {
+        to {
+          transform: rotate(1turn);
+        }
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/app.bundle.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/style-BwIv1f0J.css">
+      <link rel="stylesheet" href="/android.css" />
+  </head>
+<body>
+    <!-- ==================================================================
+         启动过渡画面（#boot-splash）
+         ==================================================================
+         Go 侧每次真正退出时抓一张窗口画面缓存成 JPEG（见 boot_frame.go），
+         这里直接把它当 <img> 铺满窗口：窗口一露面就是「刚才那个界面」，
+         等真正的界面装配好再淡出（见 js/main.js#hideBootSplash）。
+
+         两种形态的 DOM 都写死在 HTML 里（默认是加载动画，缓存图加载成功后才换成
+         data-hasframe 那一形态）—— 它必须是「第一帧就画得出来」的，
+         不能依赖哪个 JS 模块先跑一遍。 -->
+    <div id="boot-splash" aria-hidden="true">
+      <img id="boot-splash__frame" src="/boot-frame.jpg" alt="" decoding="async" />
+      <div id="boot-splash__mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 18V5l10-2v13" />
+          <circle cx="6.5" cy="18" r="2.6" />
+          <circle cx="16.5" cy="16" r="2.6" />
+        </svg>
+      </div>
+    </div>
+    <!-- ==================================================================
+         图标精灵（全部 stroke 型，颜色继承 currentColor，尺寸由 CSS 控制）
+         ================================================================== -->
+    <svg class="u-hidden" aria-hidden="true" focusable="false">
+      <defs>
+        <g id="i-base"></g>
+
+        <symbol id="i-music" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 18V5.5a1 1 0 0 1 .8-1l9-1.8a1 1 0 0 1 1.2 1V16" />
+          <circle cx="6.5" cy="18" r="2.5" />
+          <circle cx="17.5" cy="16" r="2.5" />
+        </symbol>
+
+        <symbol id="i-playlist" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7h11M4 12h8M4 17h6" />
+          <path d="M17 15V7.5l3-.6V13" />
+          <circle cx="15.5" cy="15.5" r="1.8" />
+          <circle cx="18.5" cy="13" r="1.8" />
+        </symbol>
+
+        <symbol id="i-heart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20s-7.5-4.6-7.5-9.6A4.4 4.4 0 0 1 12 7.3a4.4 4.4 0 0 1 7.5 3.1C19.5 15.4 12 20 12 20Z" />
+        </symbol>
+
+        <symbol id="i-playlist-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h11M3 12h7M3 18h7" />
+          <path d="M17 13v8M13 17h8" />
+        </symbol>
+
+        <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-3-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 2.9 14H2.7a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-3l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 2.9-1.2V2.7a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.2a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.6 1.2Z" />
+        </symbol>
+
+        <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5v14M5 12h14" />
+        </symbol>
+
+        <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.6-3.6" />
+        </symbol>
+
+        <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 12a8 8 0 1 1-2.6-5.9" />
+          <path d="M20 4v4.5h-4.5" />
+        </symbol>
+
+        <symbol id="i-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m6 9 6 6 6-6" />
+        </symbol>
+
+        <symbol id="i-chevron-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m6 15 6-6 6 6" />
+        </symbol>
+
+        <!-- 排序：三条长度递减的横线 + 向下箭头（列表排序的通用符号） -->
+        <symbol id="i-sort" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h9M4 12h6M4 18h3" />
+          <path d="M17 5v14m0 0 3-3m-3 3-3-3" />
+        </symbol>
+
+        <symbol id="i-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m9 6 6 6-6 6" />
+        </symbol>
+
+        <symbol id="i-arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5m0 0 6-6m-6 6 6 6" />
+        </symbol>
+
+        <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 6l12 12M18 6 6 18" />
+        </symbol>
+
+        <symbol id="i-minimize" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M5 12h14" />
+        </symbol>
+
+        <symbol id="i-maximize" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+          <rect x="5" y="5" width="14" height="14" rx="2" />
+        </symbol>
+
+        <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+          <path d="M8 5.2a.7.7 0 0 1 1.06-.6l9.1 5.6a.75.75 0 0 1 0 1.28l-9.1 5.6A.7.7 0 0 1 8 16.5Z" />
+        </symbol>
+
+        <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+          <rect x="7" y="5" width="3.6" height="14" rx="1.2" />
+          <rect x="13.4" y="5" width="3.6" height="14" rx="1.2" />
+        </symbol>
+
+        <symbol id="i-prev" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+          <path d="M18 6.6v10.8a.6.6 0 0 1-.93.5l-7.3-5.4a.62.62 0 0 1 0-1l7.3-5.4a.6.6 0 0 1 .93.5Z" />
+          <rect x="5" y="5.4" width="2.2" height="13.2" rx="1.1" />
+        </symbol>
+
+        <symbol id="i-next" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+          <path d="M6 6.6v10.8a.6.6 0 0 0 .93.5l7.3-5.4a.62.62 0 0 0 0-1L6.93 6.1A.6.6 0 0 0 6 6.6Z" />
+          <rect x="16.8" y="5.4" width="2.2" height="13.2" rx="1.1" />
+        </symbol>
+
+        <!-- 随机播放：两条弧线在中间交叉，右上 / 右下各一个 45° 折角箭头。
+             左上→右下的那条在交点前断开、过交点后再续上（断口留约 1.5 个线宽的白缝），
+             让底下那条“穿过去”，形成编织感；左端是圆头线尾，右端箭头压在横线末端上 -->
+        <symbol id="i-shuffle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1.77 17.42H3.42C5.22 17.42 16.22 6.55 18.02 6.55H20.2" />
+          <path d="M1.77 6.55H3.42C4.7 6.55 7.7 8.65 8.8 9.3" />
+          <path d="M13.8 14.7C14.9 14.7 16.5 17.42 18.02 17.42H20.2" />
+          <path d="m18.7 3.28 3.15 3.27-3.15 3.27" />
+          <path d="m18.7 14.15 3.15 3.27-3.15 3.27" />
+        </symbol>
+
+        <symbol id="i-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 3l3 3-3 3" />
+          <path d="M20 6H8a4 4 0 0 0-4 4v1" />
+          <path d="M7 21l-3-3 3-3" />
+          <path d="M4 18h12a4 4 0 0 0 4-4v-1" />
+        </symbol>
+
+        <symbol id="i-repeat-one" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 3l3 3-3 3" />
+          <path d="M20 6H8a4 4 0 0 0-4 4v1" />
+          <path d="M7 21l-3-3 3-3" />
+          <path d="M4 18h12a4 4 0 0 0 4-4v-1" />
+          <path d="M12 10.6l1.2-.8V15" />
+        </symbol>
+
+        <symbol id="i-arrow-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14m0 0-6-6m6 6-6 6" />
+        </symbol>
+
+        <symbol id="i-list-order" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 6h12M8 12h12M8 18h12" />
+          <path d="M4 6h.01M4 12h.01M4 18h.01" />
+        </symbol>
+
+        <symbol id="i-volume-high" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6.5 9H3v6h3.5L11 19Z" />
+          <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" />
+        </symbol>
+
+        <symbol id="i-volume-low" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6.5 9H3v6h3.5L11 19Z" />
+          <path d="M15.5 9.5a4 4 0 0 1 0 5" />
+        </symbol>
+
+        <symbol id="i-volume-mute" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6.5 9H3v6h3.5L11 19Z" />
+          <path d="m16 10 4 4m0-4-4 4" />
+        </symbol>
+
+        <symbol id="i-headphones" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 15v-3a8 8 0 0 1 16 0v3" />
+          <rect x="2.5" y="14" width="4.5" height="7" rx="2" />
+          <rect x="17" y="14" width="4.5" height="7" rx="2" />
+        </symbol>
+
+        <symbol id="i-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15" />
+        </symbol>
+
+        <symbol id="i-disc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="3.2" />
+          <path d="M12 3v2.6M12 18.4V21M3 12h2.6M18.4 12H21" />
+        </symbol>
+
+        <symbol id="i-immersive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2.5" y="5" width="19" height="14" rx="2.5" />
+          <path d="M6 14.5 10 10l4 4 2-2 2 2.5" />
+          <circle cx="8.5" cy="9" r="1.2" fill="currentColor" stroke="none" />
+        </symbol>
+
+        <symbol id="i-minimal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 8h14M8 12h8M6 16h12" />
+        </symbol>
+
+        <!-- 二次元手绘：对话气泡 + 一颗四角星（漫画分镜 / 网点纸的味道） -->
+        <symbol id="i-anime" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 13.5a3.5 3.5 0 0 1-3.5 3.5H9l-4 3v-3.4A3.5 3.5 0 0 1 3.5 13V8A3.5 3.5 0 0 1 7 4.5h9.5A3.5 3.5 0 0 1 20 8Z" />
+          <path d="M10 9.6l.85 1.9 1.9.85-1.9.85L10 15.1l-.85-1.9-1.9-.85 1.9-.85Z" />
+        </symbol>
+
+        <!-- 星阵咏唱：同心法阵 + 中心符文（纵深魔法舞台） -->
+        <symbol id="i-arcanum" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="8.6" />
+          <circle cx="12" cy="12" r="3.4" />
+          <path d="M12 5.2v3.4M18.8 12h-3.4M12 18.8v-3.4M5.2 12h3.4" />
+          <path d="M12 2.4l1.5 2.1M21.6 12l-2.1 1.5M12 21.6l-1.5-2.1M2.4 12l2.1-1.5" />
+        </symbol>
+
+        <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h7A1.5 1.5 0 0 1 19 10v7.5A1.5 1.5 0 0 1 17.5 19h-13A1.5 1.5 0 0 1 3 17.5Z" />
+        </symbol>
+
+        <symbol id="i-folder-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h7A1.5 1.5 0 0 1 19 10v7.5A1.5 1.5 0 0 1 17.5 19h-13A1.5 1.5 0 0 1 3 17.5Z" />
+          <path d="M11 12v5m-2.5-2.5h5" />
+        </symbol>
+
+        <symbol id="i-grip" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+          <circle cx="9" cy="6" r="1.5" />
+          <circle cx="15" cy="6" r="1.5" />
+          <circle cx="9" cy="12" r="1.5" />
+          <circle cx="15" cy="12" r="1.5" />
+          <circle cx="9" cy="18" r="1.5" />
+          <circle cx="15" cy="18" r="1.5" />
+        </symbol>
+
+        <symbol id="i-more" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+          <circle cx="12" cy="5.5" r="1.7" />
+          <circle cx="12" cy="12" r="1.7" />
+          <circle cx="12" cy="18.5" r="1.7" />
+        </symbol>
+
+        <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7h16M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7M6 7l1 12.2a1.5 1.5 0 0 0 1.5 1.3h7a1.5 1.5 0 0 0 1.5-1.3L18 7" />
+        </symbol>
+
+        <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 20h4l10-10a2.5 2.5 0 0 0-3.5-3.5L4 16.5Z" />
+          <path d="m13.5 7 3.5 3.5" />
+        </symbol>
+
+        <symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 5h18l-7 8.5V20l-4-2v-4.5Z" />
+        </symbol>
+
+        <symbol id="i-palette" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3a9 9 0 1 0 0 18c1.2 0 2-.9 2-2 0-1.4-1.2-1.7-1.2-3 0-1 .8-1.8 1.8-1.8H16a5 5 0 0 0 5-5c0-3.6-4-6.2-9-6.2Z" />
+          <circle cx="7.5" cy="12" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="10" cy="8" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="8.5" r="1.2" fill="currentColor" stroke="none" />
+        </symbol>
+
+        <symbol id="i-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 3 5 14h5l-1 7 8-11h-5Z" />
+        </symbol>
+
+        <!-- 警告：样式卡片提示「清单里没写配色」（宿主已降级用主题配色） -->
+        <symbol id="i-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3.6 21 19.5H3z" />
+          <path d="M12 9.6v4.2" />
+          <circle cx="12" cy="16.8" r="0.9" fill="currentColor" stroke="none" />
+        </symbol>
+
+        <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 11v5.5M12 7.8h.01" />
+        </symbol>
+
+        <symbol id="i-lyrics" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 6h9M5 10h14M5 14h11M5 18h6" />
+        </symbol>
+
+        <!-- 手动匹配歌词：直接用「词」这个字做图标。
+             SVG 里画汉字只能用 <text>；这里显式给 fill 与字体，
+             不依赖图标 sprite 的 stroke 继承（stroke 会糊掉字形）。 -->
+        <symbol id="i-lyric-match" viewBox="0 0 24 24">
+          <rect x="2.2" y="2.2" width="19.6" height="19.6" rx="5" fill="currentColor" fill-opacity=".12" />
+          <text x="12" y="17.4" text-anchor="middle" font-size="14.5" font-weight="700"
+            font-family="var(--font-sans, system-ui), 'Microsoft YaHei', sans-serif"
+            fill="currentColor" stroke="none">词</text>
+        </symbol>
+
+        <!-- 桌面歌词：在一块悬浮面板上显示歌词（与「详情页显示歌词」是两件事） -->
+        <symbol id="i-desktop-lyrics" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2.5" y="3.5" width="19" height="14" rx="2.5" />
+          <path d="M6.5 8.5h11M6.5 12.5h6" />
+          <path d="M9 21h6" />
+        </symbol>
+
+        <!-- 桌面背景歌词：把播放界面的背景铺满桌面、垫在桌面图标之下。
+             用「一幅有太阳和山的画」表达「这是一张背景/壁纸」，右下角那一横
+             是压在画上的歌词行 —— 与上面那个「悬浮面板」图标区分开。 -->
+        <symbol id="i-desktop-wallpaper" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="18" rx="2.6" />
+          <circle cx="7.4" cy="8.4" r="1.7" />
+          <path d="M2.4 16.2l4.6-4.1 3.1 2.7 3.3-2.9 2.6 2.3" />
+          <path d="M13.2 19.4h6" />
+        </symbol>
+
+        <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4" />
+        </symbol>
+
+        <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z" />
+        </symbol>
+
+        <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m5 12.5 5 5L19 7" />
+        </symbol>
+
+        <symbol id="i-album" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.5" y="3.5" width="17" height="17" rx="3" />
+          <circle cx="12" cy="12" r="3.4" />
+        </symbol>
+
+        <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7.5V12l3 1.8" />
+        </symbol>
+
+        <!-- 选项（播放器控件栏里的选项按钮）：2×2 网格 —— 左上格是同心圆，其余三格是圆角方框。
+             每格外形尺寸与参考图形一致（约 8.5/24 一格，格间留 0.7~0.8 的缝），
+             线宽沿用本图标的 1.7；左上内圈若也按 1.7 描边，16~17px 下内孔只剩不到半像素、
+             会和外圈糊成一团，所以内圈画成实心圆点，保证缩到 16px 仍然分得开 -->
+        <symbol id="i-options" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7.1" cy="6.6" r="3.4" />
+          <circle cx="7.1" cy="6.6" r="1.4" fill="currentColor" stroke="none" />
+          <rect x="13.1" y="3.2" width="6.85" height="6.85" rx="1.9" />
+          <rect x="3.7" y="12.5" width="6.85" height="6.85" rx="1.9" />
+          <rect x="13.1" y="12.5" width="6.85" height="6.85" rx="1.9" />
+        </symbol>
+
+        <!-- 播放选项面板里三项各自的图标（第四项「桌面歌词」用上面的 i-desktop-lyrics） -->
+        <!-- 字号：一个够粗的 A。14~16px 的图标里放不下「A + 双向箭头」那种
+             标准字号图标（箭头会糊成一根竖线），所以只留 A，量程交给滑条两端的 14 / 72 读数 -->
+        <symbol id="i-text-size" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3.5 19.5 12 4.5l8.5 15M6.9 14h10.2" />
+        </symbol>
+
+        <!-- 音效：居中对称的波形（声音的形状），与音量、均衡滑杆那类图标区分开 -->
+        <symbol id="i-eq" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 10.5v3M8 8v8M12 6v12M16 8.5v7M20 10.5v3" />
+        </symbol>
+
+        <!-- 背景不透明度：圆里填掉一半，就是「透明 → 不透明」 -->
+        <symbol id="i-opacity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 3a9 9 0 0 0 0 18Z" fill="currentColor" stroke="none" />
+        </symbol>
+
+        <symbol id="i-queue" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h11M4 11h11M4 16h7" />
+          <path d="m17 15 4 2.5-4 2.5Z" />
+        </symbol>
+
+        <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 3H7.5A1.5 1.5 0 0 0 6 4.5v15A1.5 1.5 0 0 0 7.5 21h9a1.5 1.5 0 0 0 1.5-1.5V8Z" />
+          <path d="M13 3v5h5" />
+        </symbol>
+
+        <symbol id="i-scale" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v18M5 8h14M8 8l-3 6h6ZM16 8l-3 6h6Z" />
+        </symbol>
+
+        <!-- 外部链接：关于页里指向仓库 / 协议的按钮，提示「会离开本应用」 -->
+        <symbol id="i-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 5h6v6M19 5l-7.5 7.5" />
+          <path d="M18 14.5V18a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 18V9a1.5 1.5 0 0 1 1.5-1.5H11" />
+        </symbol>
+
+        <symbol id="i-regex" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 16.5 9.5 13M9.5 13 6 9.5M9.5 13H3" />
+          <circle cx="15" cy="15.5" r="1.6" />
+          <path d="M18.5 5v7M15.5 6.5l6 3.5M21.5 6.5l-6 3.5" />
+        </symbol>
+
+        <!-- 图片 / 封面：用来表示「换封面」这个动作 -->
+        <symbol id="i-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+          <circle cx="8.5" cy="9.5" r="1.6" />
+          <path d="M4 17.5 9 12l3.5 3.5L15 13l5 4.5" />
+        </symbol>
+
+        <!-- 轮播：叠起来的两张图 + 循环箭头，表示「多张封面轮换显示」 -->
+        <symbol id="i-slideshow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="7" y="3.5" width="14" height="11" rx="2.2" />
+          <path d="M4 7.5v9A2.5 2.5 0 0 0 6.5 19H16" />
+          <path d="M12.5 12.5 15 10l2.5 2.5M17.5 7.5 15 10l-2.5-2.5" />
+        </symbol>
+
+        <!-- 密度：列表行高 -->
+        <symbol id="i-density" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+        </symbol>
+
+        <!-- 嵌入元数据：写进文件 -->
+        <symbol id="i-tag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11.5 3H20v8.5L11 20.5a2 2 0 0 1-2.8 0l-5.7-5.7a2 2 0 0 1 0-2.8Z" />
+          <circle cx="16" cy="7.5" r="1.5" />
+        </symbol>
+
+        <!-- 下载任务：箭头落进托盘 -->
+        <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3.5v11" />
+          <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+          <path d="M4.5 19.5h15" />
+        </symbol>
+      </defs>
+    </svg>
+
+    <!-- ==================================================================
+         应用骨架
+         ==================================================================
+         迁移到 Lit 之后，标题栏 / 侧边栏 / 内容区 / 底栏 / 各种浮层都由
+         <mp-app> 及其子组件渲染（见 js/ui/*.js），这里只留一个挂载点。
+
+         为什么不再把它们静态写在 HTML 里：
+           · 静态节点必须靠「谁去 $() 拿它、谁去改哪个属性」的隐性分工来同步，
+             少写一处就是「点了没反应 / 界面不更新」；
+           · Lit 组件用依赖数组声明自己要什么，更新是增量的（part 级 diff），
+             也不会再出现「整块 innerHTML 重建 → 丢焦点 / 丢滚动 / 重播动画」。
+
+         图标精灵仍然留在这里：它是纯静态资源（theme / 皮肤 / 自检脚本都按
+         #i-xxx 引用），放进模板只会每次渲染都重新解析一遍。
+
+         保留的对外契约：所有 id / class 与迁移前一致，皮肤包
+         （packages/player-skins）拼的容器 id、以及 tools/*.mjs 自检脚本
+         查询的选择器都没有变化。
+    -->
+    <mp-app></mp-app>
+
+
+      <script src="/android.js" defer></script>
+  </body>
+</html>

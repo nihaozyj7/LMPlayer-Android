@@ -1,0 +1,1998 @@
+/* ==========================================================================
+   android.css — LMPlayer 手机端骨架（第三版：标题栏 + 表头 + 单条播放栏）
+   --------------------------------------------------------------------------
+   手机端不是把桌面窗口拉窄，而是另一套骨架：
+
+     1. 顶部 appbar（56dp）：左菜单图标（拉出分类抽屉）、中间当前视图标题
+        （跟着桌面 #content-title 走）、右侧搜索图标；
+     2. 头部第二行：左侧表头（排序字段 + 方向 + 首数，点它弹排序 sheet），
+        右侧一排纯图标按钮（播放全部 / 多选 / 添加 / 清空，随视图变）；
+     3. 主内容单列：曲目行 68dp 触摸友好，列表在顶部时下拉刷新；
+     4. 右下角圆形浮标 = 定位到当前播放（队列/多选态自动收起）；
+     5. 底部**只有一条**播放栏（68dp）：封面 + 标题/歌手 + 播放暂停 + 队列，
+        顶部一条 2dp 进度线；点整条进全屏播放详情页；
+     6. 抽屉是分类入口：主题切换、各视图、歌单、设置、下载；
+     7. 设置是独立整页：分类列表页 → 分区页，返回箭头逐级退回；
+     8. 搜索是整页：在线 / 本地两个分段，默认在线；
+     9. 桌面所有 `.menu` 弹出菜单统一改成贴底 sheet。
+
+   契约：只改样式与少量 DOM 增强，不动打包产物里的 id / class / 事件绑定。
+   关键布局必须带 !important —— 主题 CSS 与组件 CSS 都排在本文档之后。
+
+   踩过的坑（别改回去）：
+     · 桌面 tracktable.css 的 1180/1040/900 三级断点会砍掉封面列与「更多」，
+       手机要显式恢复（!important），否则列表只剩标题；
+     · 底栏按钮在桌面是 id 选择器（特异性 1,0,0），覆盖它们必须同样带 id；
+     · 触屏没有 hover，[data-tip] 浮标点一下就会永久挂在屏幕上，要清掉。
+   ========================================================================== */
+
+@media (max-width: 900px) {
+  :root {
+    --h-titlebar: 56px !important;
+    /* 只有一条播放栏：68dp + 手势条安全区 */
+    --h-playerbar: 68px !important;
+    --h-header: 0px !important;
+    --h-pv-head: 52px !important;
+    --m-safe-b: 0px;
+  /* 注意：这里**不用** env(safe-area-inset-*)。
+     Kotlin 外壳（MainActivity.applyEdgeToEdge）已经按 systemBars insets 给
+     WebView 的容器加了上下 padding，WebView 视口本身就在状态栏与手势条之间；
+     而 WebView 里 env(safe-area-inset-top/bottom) 仍然会报出状态栏高度，
+     两处叠加就成了「App 顶上凭空多一条 52px 空白」。 */
+
+    --m-gutter: 16px;
+    --m-tap: 44px;
+    --m-line: var(--line, rgba(255, 255, 255, 0.08));
+  }
+
+  /* 详情态转场不再用 --pv-p 变量驱动：自定义属性可继承，写在 .app 上会把
+     整棵子树的样式全部标脏（曲库几百行每帧白重算一遍）；而底栏高度又挂在
+     面板的 bottom 上，等于每帧让整块舞台重新布局（实测单帧 9~18ms）。
+     现在几何量全部由 android.js 直接写在那几个元素的行内样式上，CSS 只负责
+     两个停点（.m-pv-open 有无）。 */
+  .app {
+    --pv-p: 1;
+  }
+
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  [data-tip]::after,
+  [data-tip]::before {
+    display: none !important;
+    content: none !important;
+  }
+
+  /* ---------------------------------------------------------------- 骨架 */
+  .app {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: var(--h-titlebar) minmax(0, 1fr) var(--h-playerbar) !important;
+    grid-template-areas:
+      "titlebar"
+      "main"
+      "playerbar" !important;
+    width: 100%;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .app::before {
+    height: calc(var(--h-titlebar) + 10px);
+  }
+
+  .app::after {
+    height: calc(var(--h-playerbar) + 6px);
+  }
+
+  /* ============================================================ 顶部 appbar */
+  .titlebar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--h-titlebar);
+    padding: 0 6px 0 2px;
+    border-bottom: 1px solid var(--m-line);
+  }
+
+  .titlebar__drag {
+    display: none;
+  }
+
+  /* 手机上标题就是中间那排分类胶囊，品牌名让位 */
+  .titlebar__brand {
+    display: none !important;
+  }
+
+  /* 手机上不存在（也没有意义）的窗口控件 */
+  #btn-win-min,
+  #btn-win-max,
+  #btn-win-close {
+    display: none !important;
+  }
+
+  /* 主题 / 设置 / 下载都在抽屉里：顶栏只留搜索 */
+  #btn-theme-toggle,
+  #btn-settings,
+  #btn-downloads {
+    display: none !important;
+  }
+
+  .titlebar__actions {
+    display: flex;
+    align-items: center;
+    flex: none;
+    margin-left: 0;
+  }
+
+  .titlebar__btn {
+    width: var(--m-tap);
+    height: var(--m-tap);
+    border-radius: 14px;
+  }
+
+  .titlebar__btn svg {
+    width: 21px;
+    height: 21px;
+  }
+
+  /* 左：菜单图标（android.js 注入） */
+  #android-burger {
+    flex: 0 0 auto;
+    width: var(--m-tap);
+    height: var(--m-tap);
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 14px;
+    background: transparent;
+    color: var(--text-1, #e8e8f0);
+  }
+
+  #android-burger svg {
+    width: 22px;
+    height: 22px;
+    stroke: currentColor;
+    stroke-width: 1.9;
+    fill: none;
+    stroke-linecap: round;
+  }
+
+  #android-burger:active {
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  /* 中：当前视图标题（android.js 从 #content-title 同步） */
+  .m-appbar-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    padding: 0 2px 0 6px;
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--text-1, #e8e8f0);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* --------------------------------------------------------- 分类抽屉 */
+  /* 抽屉盖住整个屏幕高度（含 appbar），更像原生侧栏 */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(84vw, 340px);
+    z-index: 9500;
+    opacity: 1;
+    transform: translateX(-104%);
+    transition: transform 0.26s cubic-bezier(0.22, 0.61, 0.36, 1);
+    background: var(--bg-app, #0b0b0f);
+    border-right: 1px solid var(--m-line);
+    box-shadow: 24px 0 48px rgba(0, 0, 0, 0.5);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0 0 16px;
+  }
+
+  .app.sb-open .sidebar {
+    transform: none;
+  }
+
+  .sidebar__scroll {
+    padding: 0;
+    gap: 0;
+  }
+
+  .sidebar .sidebar__group {
+    margin: 0 0 6px;
+  }
+
+  .sidebar .sidebar__label {
+    height: 32px;
+    padding: 0 18px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: none;
+  }
+
+  .sidebar .navitem {
+    height: 50px;
+    border-radius: 0;
+    margin: 0;
+    padding: 0 18px;
+    font-size: 15px;
+    gap: 12px;
+    background: none;
+  }
+
+  .sidebar .navitem[aria-selected="true"] {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-1);
+  }
+
+  .sidebar .navitem svg {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+  }
+
+  .sidebar .navitem:active {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  /* 抽屉里的入口块（android.js 注入） */
+  .m-drawer-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 56px;
+    padding: 0 18px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-1);
+  }
+
+  .m-drawer-head__logo {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--accent, #4c8dff);
+  }
+
+  .m-drawer-head__logo svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+  }
+
+  .m-drawer-row {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    width: 100%;
+    height: 50px;
+    padding: 0 18px;
+    border: 0;
+    background: none;
+    color: var(--text-1);
+    font-size: 15px;
+    text-align: left;
+  }
+
+  .m-drawer-row:active {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .m-drawer-row__icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    color: var(--text-2, rgba(244, 244, 246, 0.66));
+  }
+
+  .m-drawer-row__icon svg {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+  }
+
+  .m-drawer-row__label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .m-drawer-row__tail {
+    flex: none;
+    font-size: 12.5px;
+    color: var(--text-3);
+  }
+
+  .m-drawer-sep {
+    height: 1px;
+    margin: 8px 0;
+    background: var(--m-line);
+  }
+
+  #sb-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 9400;
+    border: 0;
+    padding: 0;
+    margin: 0;
+  }
+
+  /* ----------------------------------------------------------- 主内容 */
+  .main {
+    position: relative;
+    grid-template-rows: auto minmax(0, 1fr) !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    min-width: 0;
+  }
+
+  /* 下拉刷新时整块列表跟着手指下沉；transform 不影响虚拟列表的高度计算 */
+  #content-body {
+    transition: transform 0.16s ease;
+  }
+
+  .content-header,
+  .content-header__titles,
+  .content-header__actions {
+    min-width: 0;
+  }
+
+  /* 手机上不再有「标题 + 副标题 + 工具条」那一大块：标题搬进 appbar，
+     数量与排序进表头，这块只剩一排图标按钮。 */
+  .content-header {
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    row-gap: 0;
+    height: 52px;
+    min-height: 0;
+    padding: 0 var(--m-gutter);
+  }
+
+  .content-header__titles {
+    display: none !important;
+  }
+
+  .content-header__title {
+    font-size: 20px;
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .content-header__subtitle {
+    font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* .content-header__actions 只是一个包装盒（里面是过滤框 + 工具条），
+     手机上把它摊平，让标题、工具条各自成为头部的一行。 */
+  .content-header__actions {
+    display: contents !important;
+  }
+
+  .content-header__actions .btn {
+    height: var(--m-tap);
+    min-width: var(--m-tap);
+    padding: 0;
+    border-radius: 14px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .content-header__actions .btn--icon {
+    width: var(--m-tap);
+    padding: 0;
+  }
+
+  /* 工具条只留图标：文字一律隐藏（手机上「图标 + 文字」横排既占宽又难戳） */
+  #content-tools .btn > span,
+  #content-tools .btn .btn__dir {
+    display: none !important;
+  }
+
+  #content-tools .btn {
+    justify-content: center;
+    gap: 0;
+    padding: 0 !important;
+    width: var(--m-tap);
+    min-width: var(--m-tap);
+  }
+
+  /* 这三个各有更顺手的入口，按钮本身隐去：
+     重扫 → 下拉刷新；排序 → 表头；定位 → 右下角悬浮按钮 */
+  #content-tools [data-tool="rescan"],
+  #content-tools [data-tool="sort"],
+  #content-tools [data-tool="locate"] {
+    display: none !important;
+  }
+
+  /* 多选态的「已选 N 首」是纯文字，保留 */
+  #content-tools .toolbar__selinfo {
+    margin-right: auto;
+    font-size: 13px;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  /* 播放全部 / 多选 / 添加 / 清空：一行右对齐，不换行、不横滑 */
+  .content-header__tools {
+    order: 2;
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .content-header__tools::-webkit-scrollbar {
+    display: none;
+  }
+
+  .content-header__tools > * {
+    flex: none;
+  }
+
+  /* ======================================================== 表头（头部左侧） */
+  .m-thead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 1 auto;
+    min-width: 0;
+    height: auto;
+    padding: 0;
+    border: 0;
+    font-size: 12.5px;
+    color: var(--text-2, rgba(244, 244, 246, 0.66));
+  }
+
+  .m-thead__sort {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .m-thead__sort:active {
+    color: var(--accent, #4c8dff);
+  }
+
+  .m-thead__dir {
+    width: 13px;
+    height: 13px;
+    color: var(--accent, #4c8dff);
+    transition: transform 0.16s ease;
+  }
+
+  .m-thead__dir[data-dir="asc"] {
+    transform: rotate(180deg);
+  }
+
+  .m-thead[data-sortable="0"] .m-thead__sort {
+    display: none;
+  }
+
+  .m-thead__count {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--text-3);
+  }
+
+  /* ================================================ 弹出菜单统一成贴底 sheet */
+  /* 桌面的弹出菜单是「贴着被点按钮的小浮层」，手机上既容易越界，也不符合
+     Material 的手感；定位是 an() 写成内联 left/top 的，所以必须 !important。 */
+  .menu {
+    position: fixed !important;
+    left: 10px !important;
+    right: 10px !important;
+    top: auto !important;
+    bottom: calc(var(--h-playerbar) + 10px) !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    max-height: min(64vh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-radius: 18px !important;
+    z-index: 9750 !important;
+  }
+
+  .menu__item {
+    min-height: 46px;
+  }
+
+  /* 未选中项不该显示对勾（桌面靠主题 CSS 控制，这里显式关掉） */
+  .menu__item[aria-checked="false"] .menu__check {
+    opacity: 0 !important;
+  }
+
+  /* ============================================== 右下角悬浮：定位当前播放 */
+  .m-fab {
+    position: fixed;
+    right: 16px;
+    bottom: calc(var(--h-playerbar) + 16px);
+    width: 52px;
+    height: 52px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 26px;
+    background: var(--accent, #4c8dff);
+    color: #fff;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+    z-index: 9000;
+    transition: transform 0.14s ease, opacity 0.14s ease;
+  }
+
+  .m-fab:active {
+    transform: scale(0.94);
+  }
+
+  .m-fab__icon {
+    width: 24px;
+    height: 24px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.9;
+  }
+
+  /* 播放详情页整屏都是控件，浮标让位；队列/多选也隐藏，免得挡住行尾操作 */
+  .app[data-view="player"] .m-fab,
+  body[data-pv="1"] .m-fab,
+  .app[data-mfab="0"] .m-fab {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* ======================================================== 下拉刷新指示器 */
+  .m-pull {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    margin-left: -72px;
+    width: 144px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border-radius: 0 0 18px 18px;
+    background: rgba(22, 22, 28, 0.92);
+    color: var(--text-2, rgba(244, 244, 246, 0.66));
+    font-size: 12.5px;
+    opacity: 0;
+    transform: translateY(0);
+    pointer-events: none;
+    z-index: 30;
+    transition: opacity 0.14s ease;
+  }
+
+  .m-pull__dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: var(--text-3);
+    transition: background 0.14s ease;
+  }
+
+  .m-pull[data-hot="1"] .m-pull__dot {
+    background: var(--accent, #4c8dff);
+  }
+
+  .m-pull[data-busy="1"] .m-pull__dot {
+    background: var(--accent, #4c8dff);
+    animation: m-pull-pulse 0.9s ease-in-out infinite;
+  }
+
+  @keyframes m-pull-pulse {
+    0%,
+    100% {
+      opacity: 0.3;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  /* 列表内的「筛选本地歌曲」框在手机上不出现：
+     顶部的搜索图标进的是整页搜索（含本地搜索），同一件事不做两个入口，
+     否则列表头要多占 48dp，还要和整页搜索抢焦点。 */
+  #content-filter {
+    display: none !important;
+  }
+
+  /* 曲目列表 */
+  .tracks__head {
+    display: none !important;
+  }
+
+  .tracks__pad {
+    height: 6px !important;
+  }
+
+  .track {
+    grid-template-columns: 52px minmax(0, 1fr) auto 44px !important;
+    column-gap: 12px !important;
+    height: 68px;
+    padding: 0 var(--m-gutter) 0 12px !important;
+    border-radius: 0;
+  }
+
+  .track__handle,
+  .track__index,
+  .track__album,
+  .track__heart {
+    display: none !important;
+  }
+
+  /* 桌面为窄窗口准备的三级精简表会把封面与「更多」一起砍掉 ——
+     那是给"桌面窗口拉窄"用的，手机上这两样都要留着。 */
+  .track__cover {
+    display: block !important;
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .track__more {
+    display: grid !important;
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    opacity: 1 !important;
+  }
+
+  .track__title {
+    font-size: 15.5px;
+    line-height: 1.3;
+  }
+
+  .track__sub {
+    font-size: 12.5px;
+    gap: 6px;
+  }
+
+  .track__time {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+
+  .track:active {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  /* ==================================================== 底部播放栏（主页） */
+  .playerbar {
+    /* 两种状态下**同一块布尔盒**：190dp 高、bottom 贴底，主页态整体下移
+       122dp（190 - 68）只露出底部那 68dp。转场里只改 transform —— 没有
+       height 变化、没有布局重排，所以不会出现「关闭时底栏自己缩一下」那种
+       闪。内容用 align-content: end 贴底，主页行恰好落在被露出的那 68dp 里，
+       与详情态 now 的位置（bottom: 0 / 68dp / 居中）逐像素对齐。 */
+    position: fixed !important;
+    top: auto !important;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* 必须压在面板之上：详情态的三行控件就在这块里，面板那 190dp 是给它
+       让出来的（面板靠 padding-bottom 让位）。 */
+    z-index: 9455;
+    display: grid !important;
+    grid-template-columns: 56px minmax(0, 1fr) 48px 48px;
+    align-content: start;
+    align-items: center;
+    column-gap: 8px;
+    row-gap: 0;
+    height: 190px;
+    box-sizing: border-box;
+    /* 详情态的三行控件在底栏还没滑上来时在屏幕外，留着 hidden 更安全 */
+    overflow: hidden !important;
+    /* 主页态整块下移 122dp，露出来的是**元素顶部 68dp** —— 主页行就排在那里
+       （align-content: start + padding-top 8），所以露出的位置和迷你条完全一致。 */
+    transform: translate3d(0, 122px, 0);
+    transition: transform 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+    will-change: transform;
+    padding: 8px 4px 0 10px !important;
+    border-top: 1px solid var(--m-line);
+  }
+
+  /* 详情态三行控件的外壳：实心、190dp、从底部滑上来。
+     它自己带背景，所以底栏本体不必长高；迷你条被它盖住，不需要淡出。 */
+
+
+  /* 桌面把 data-view 切到 player 的那一瞬，皮肤还在异步挂载：底栏/标题栏会先
+     变成透明（桌面 CSS：[data-view=player] .playerbar{background:none}），
+     用户看到的就是「点进去先闪一下」。这段窗口用 m-pv-pending 顶住主页样式，
+     等我们真正开始滑动了再交还给皮肤。 */
+  .app.m-pv-pending .playerbar,
+  .app.m-pv-pending .titlebar {
+    background: var(--glass-bg-weak, #14141a) !important;
+    border-color: var(--m-line) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  /* 把三层面板摊平成播放栏的直接子项，各自占一格 */
+  .playerbar__row,
+  .playerbar__now,
+  .playerbar__center,
+  .playerbar__tools,
+  .transport {
+    display: contents !important;
+  }
+
+  /* 进度：顶部一条 2dp 细线（不可拖；拖动在详情页里做） */
+  .playerbar__progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    padding: 0;
+    gap: 0;
+    margin: 0;
+    pointer-events: none;
+  }
+
+  .playerbar__progress .progress__time,
+  .playerbar__progress .slider__thumb,
+  .playerbar__progress .slider__bubble {
+    display: none !important;
+  }
+
+  .playerbar__progress .slider {
+    width: 100%;
+    height: 2px;
+    display: block;
+  }
+
+  .playerbar__progress .slider__rail,
+  .playerbar__progress .slider__fill {
+    height: 2px;
+    border-radius: 0;
+  }
+
+  .playerbar__progress .slider__rail {
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  /* 封面 */
+  #bar-cover {
+    grid-area: 1 / 1;
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+    overflow: hidden;
+    padding: 0;
+    place-self: center;
+  }
+
+  /* 标题 / 歌手 */
+  .playerbar__meta {
+    grid-area: 1 / 2;
+    display: flex !important;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    min-width: 0;
+    padding: 0;
+  }
+
+  .playerbar__title {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .playerbar__sub {
+    display: block !important;
+    font-size: 12.5px;
+    color: var(--text-3);
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* 播放 / 暂停 */
+  #btn-play {
+    grid-area: 1 / 3;
+    display: grid !important;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    place-self: center;
+  }
+
+  #btn-play svg {
+    width: 25px;
+    height: 25px;
+  }
+
+  /* 队列 */
+  #btn-playlist {
+    grid-area: 1 / 4;
+    display: grid !important;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    place-self: center;
+  }
+
+  #btn-playlist svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  /* 主页播放栏上不出现：上一首/下一首、喜欢、加入、音量、模式、歌词、定时、选项 */
+  #btn-prev,
+  #btn-next,
+  #bar-heart,
+  #bar-add,
+  .playerbar__tools .volume,
+  #btn-mode,
+  #btn-lyrics,
+  #btn-sleep,
+  #btn-options {
+    display: none !important;
+  }
+
+  /* =============================================== 播放详情页（全屏三行） */
+  .playerview {
+    position: fixed !important;
+    inset: auto !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    /* 底栏那 190dp 用内边距让出来，**不写** bottom: var(--h-playerbar)：
+       底栏在转场里是从 68 长到 190 的，面板若跟着变高变矮，整块舞台（含皮肤
+       DOM）每帧都要重新布局。内边距写死 190，面板在整段转场里尺寸恒定，
+       动的只有 transform（合成层，主线程被卡住也照样按帧走）。 */
+    padding-bottom: 190px;
+    box-sizing: border-box;
+    z-index: 9450;
+    display: grid;
+    grid-template-rows: var(--h-pv-head) minmax(0, 1fr) !important;
+    opacity: 1 !important;
+    /* 关着的状态：整块沉到屏幕下面（100% = 自身高度） */
+    transform: translate3d(0, 100%, 0);
+    transition: transform 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+    will-change: transform;
+    /* 竖滑留给内容滚动，横滑由我们自己接管（切歌） */
+    touch-action: pan-y;
+  }
+
+  .app.m-pv-open .playerview {
+    transform: translate3d(0, 0, 0);
+  }
+
+  /* 跟手期间必须关掉过渡，否则元素追不上手指（行内样式里的 transition 由
+     android.js 自己写，这里兜住 CSS 侧的冲突） */
+  .app.m-pv-drag .playerview {
+    transition: none !important;
+  }
+
+  /* 头部与舞台**不做**独立位移/淡入：整块面板就是一张卡片，从底部滑上来，
+     里面所有内容跟着一起走。以前给它们各配一套差速动画（头部位移、舞台
+     位移、封面替身飞行），三套时间轴叠在一起就是用户说的「杂乱、会闪现」。
+     现在是单一自由度 p —— 面板 translateY + 底栏 translateY。 */
+  .playerview__head,
+  #playerview-stage {
+    opacity: 1;
+    transform: none;
+  }
+
+  .playerview__head {
+    height: var(--h-pv-head);
+    padding: 0 8px;
+    gap: 4px;
+    border-bottom: 1px solid var(--m-line);
+  }
+
+  .playerview__back {
+    width: var(--m-tap);
+    height: var(--m-tap);
+    padding: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 14px;
+  }
+
+  .playerview__back span {
+    display: none;
+  }
+
+  .playerview__back svg {
+    width: 21px;
+    height: 21px;
+  }
+
+  /* 皮肤为了「复古玻璃感」给**每一行**歌词挂了 filter: blur(0.3px)（实测 64 行
+     = 64 个独立合成层），黑胶盘片下还有一块 blur(38px) 的大面积高斯模糊。
+     面板整块做 transform 动画时这些层要一起合成，模拟器上帧率直接掉到 8fps。
+     0.3px 的模糊肉眼看不出来，手机上直接去掉；盘片辉光改用径向渐变，
+     观感几乎一致但不需要高斯模糊。 */
+  .playerview .lyric,
+  .playerview .lyric * {
+    filter: none !important;
+  }
+
+  .playerview .disc__shadow {
+    filter: none !important;
+    border-radius: 50% !important;
+    background: radial-gradient(closest-side, rgba(120, 170, 255, 0.22), rgba(120, 170, 255, 0)) !important;
+  }
+
+  .viewmode {
+    gap: 2px;
+    padding: 2px;
+    border-radius: 14px;
+  }
+
+  .viewmode__btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+  }
+
+  .viewmode__btn svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .playerview__stage {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* —— 详情态：底栏变成三行（进度 / 主控 / 工具）。
+     用 flex column 而不是 grid：桌面把这三块都做成了「绝对定位 +
+     translateX(-50%) 居中」，在 grid 里它们会带着这些残留属性乱跑；
+     flex 下每块都是普通块级子项，重置完定位就不会再被拖走。
+     注意这里**不改 height**（恒定 190dp，见 .playerbar），只换布局。 */
+  .app[data-view="player"] .playerbar {
+    display: flex !important;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-end;
+    row-gap: 4px;
+    padding: 6px var(--m-gutter) 10px !important;
+    border-top: 0;
+    /* 桌面在详情态把底栏做成透明（让皮肤背景透上来）。手机上不行：面板是
+       一整块实心面，底栏透明就会「透过底栏看到面板里的封面和歌名」——
+       转场中途尤其明显（控件浮在盘片和标题上面）。这里保持实心。 */
+    background: var(--bg-app, #0b0b0f) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    border-top: 1px solid var(--m-line) !important;
+  }
+
+  .app.m-pv-open .playerbar {
+    transform: none;
+  }
+
+  .app[data-view="player"] .playerbar__row {
+    display: contents !important;
+  }
+
+  /* 主页那一行（封面 + 标题 + 歌手）在详情态不参与 flex 排布，钉在底栏
+     **顶部** 68dp 那一格里：底栏下移 122dp 时露出来的正是这一格，所以
+     「打开瞬间」和「主页态」看到的是同一块像素，不会跳。 */
+  .app[data-view="player"] .playerbar__now {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    position: absolute !important;
+    left: var(--m-gutter) !important;
+    right: var(--m-gutter) !important;
+    top: 8px !important;
+    bottom: auto !important;
+    height: 52px;
+    margin: 0 !important;
+    opacity: 1;
+    pointer-events: none;
+  }
+
+  .app[data-view="player"].m-pv-open .playerbar__now {
+    opacity: 0;
+  }
+
+  /* 三行控件：opacity 由 android.js 逐帧写（跟手），这里只给兜底终态 */
+  .app[data-view="player"] .playerbar__progress,
+  .app[data-view="player"] .playerbar__center,
+  .app[data-view="player"] .playerbar__tools {
+    opacity: 0;
+  }
+
+  .app[data-view="player"].m-pv-open .playerbar__progress,
+  .app[data-view="player"].m-pv-open .playerbar__center,
+  .app[data-view="player"].m-pv-open .playerbar__tools {
+    opacity: 1;
+  }
+
+  /* 进度行 */
+  .app[data-view="player"] .playerbar__progress {
+    position: static !important;
+    left: auto !important;
+    right: auto !important;
+    top: auto !important;
+    bottom: auto !important;
+    transform: none !important;
+    width: auto !important;
+    height: 26px;
+    display: flex !important;
+    align-items: center;
+    gap: 10px;
+    padding: 0;
+    margin: 0;
+    pointer-events: auto;
+  }
+
+  .app[data-view="player"] .playerbar__progress .progress__time {
+    display: block !important;
+    flex: none;
+    width: 42px;
+    font-size: 11px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .app[data-view="player"] .playerbar__progress .slider {
+    position: static !important;
+    flex: 1 1 auto !important;
+    width: auto !important;
+    height: 26px;
+    display: flex;
+    align-items: center;
+  }
+
+  .app[data-view="player"] .slider__rail {
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.16);
+  }
+
+  .app[data-view="player"] .slider__fill {
+    height: 4px;
+    border-radius: 999px;
+  }
+
+  .app[data-view="player"] .slider__thumb {
+    display: block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+  }
+
+  /* 主控行 */
+  .app[data-view="player"] .playerbar__center {
+    position: static !important;
+    left: auto !important;
+    right: auto !important;
+    /* 同时清掉桌面的 translateX(-50%) 居中（跟手位移由行内样式写） */
+    transform: none !important;
+    width: auto !important;
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+  }
+
+  .app[data-view="player"] .transport {
+    position: static !important;
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    gap: 40px;
+    transform: none !important;
+  }
+
+  .app[data-view="player"] #btn-prev,
+  .app[data-view="player"] #btn-next {
+    display: grid !important;
+    place-items: center;
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+  }
+
+  .app[data-view="player"] #btn-prev svg,
+  .app[data-view="player"] #btn-next svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  .app[data-view="player"] #btn-play {
+    display: grid !important;
+    place-items: center;
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+  }
+
+  .app[data-view="player"] #btn-play svg {
+    width: 30px;
+    height: 30px;
+  }
+
+  /* 工具行：音量条在手机上是系统音量，继续收起 */
+  .app[data-view="player"] .playerbar__tools {
+    position: static !important;
+    left: auto !important;
+    right: auto !important;
+    transform: none !important;
+    display: flex !important;
+    width: 100% !important;
+    /* 桌面这块是「靠右对齐」的（align-self 相关），在 flex column 里会变成
+       交叉轴收缩 —— 显式拉伸，否则整行工具挤在左边 59px 里。
+       另外桌面给它写了 max-width: calc(50% - 130px)（为了在播放条里居中摆放），
+       手机上必须放开，否则 5 个图标挤成一团。 */
+    align-self: stretch !important;
+    max-width: none !important;
+    align-items: center;
+    justify-content: space-around;
+    gap: 0;
+    margin: 0;
+  }
+
+  .app[data-view="player"] .playerbar__tools .volume {
+    display: none !important;
+  }
+
+  .app[data-view="player"] .playerbar__tools #btn-mode,
+  .app[data-view="player"] .playerbar__tools #btn-lyrics,
+  .app[data-view="player"] .playerbar__tools #btn-sleep,
+  .app[data-view="player"] .playerbar__tools #btn-options,
+  .app[data-view="player"] .playerbar__tools #btn-playlist {
+    position: static !important;
+    display: grid !important;
+    place-items: center;
+    flex: 1 1 0;
+    width: auto !important;
+    height: 52px;
+    border-radius: 14px;
+    transform: none !important;
+  }
+
+  .app[data-view="player"] .playerbar__tools .mode-btn svg {
+    width: 23px;
+    height: 23px;
+  }
+
+  /* ==================================================== 设置（独立整页 + 分区） */
+  .settings-layer {
+    inset: 0 !important;
+    padding: 0 !important;
+    background: var(--bg-app, #0b0b0f) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    z-index: 9600;
+  }
+
+  .settings-layer__panel {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    border-radius: 0;
+    border: 0;
+    box-shadow: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-app, #0b0b0f);
+    padding-top: 0;
+  }
+
+  .settings-layer[data-state="opened"] .settings-layer__panel {
+    transform: none;
+  }
+
+  .settings-layer__head {
+    flex: none;
+    height: 56px;
+    padding: 0 8px 0 6px;
+    gap: 4px;
+    border-bottom: 1px solid var(--m-line);
+  }
+
+  .settings-layer__icon {
+    display: none;
+  }
+
+  .settings-layer__title {
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .settings-layer__close {
+    width: var(--m-tap);
+    height: var(--m-tap);
+    border-radius: 14px;
+  }
+
+  .settings-layer__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0 !important;
+    border: 0 !important;
+  }
+
+  .settings-layer__body .settings {
+    max-width: none;
+    padding: 0 0 calc(24px + var(--m-safe-b));
+    gap: 0;
+  }
+
+  /* 桌面那个居中导航条在手机上换成分类列表页 */
+  .settings__nav {
+    display: none !important;
+  }
+
+  .card {
+    border-radius: 0 !important;
+    border: 0 !important;
+    border-bottom: 1px solid var(--m-line) !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    margin: 0;
+  }
+
+  .card::before {
+    display: none;
+  }
+
+  .card__icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+  }
+
+  .card__icon svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* 卡片头：标题块占满第一行，操作按钮落到第二行 */
+  .card__head {
+    flex-wrap: wrap;
+    padding: 16px var(--m-gutter) 8px;
+    gap: 10px;
+    border-bottom: 0;
+  }
+
+  .card__titles {
+    flex: 1 1 60%;
+    min-width: 0;
+  }
+
+  .card__title {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .card__desc {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-3);
+  }
+
+  .card__body {
+    padding: 4px var(--m-gutter) 10px;
+  }
+
+  .card__foot {
+    padding: 10px var(--m-gutter);
+    border-top: 0;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .card__body .row,
+  .card__body .field,
+  .card__body .pathrow {
+    min-width: 0;
+  }
+
+  /* —— 设置项：手机上不再左右两栏 ——
+     桌面的 .setting 是「说明在左、控件在右」的一行 flex，窗口拉窄后标签被挤成
+     竖排、开关与文字抢同一行。手机统一改成上下两行：说明占满一整行，控件另起
+     一行、从左往右排（放不下就换行），这样长文案与长输入框都不会被压扁。 */
+  .setting {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+    min-height: 0 !important;
+    padding: 14px var(--m-gutter) !important;
+    border-radius: 0 !important;
+    border-bottom: 1px solid var(--m-line);
+  }
+
+  .setting:hover {
+    background: none;
+  }
+
+  .setting--group-start {
+    margin-top: 0 !important;
+    border-top: 0 !important;
+    border-radius: 0 !important;
+  }
+
+  .setting__main {
+    flex: 1 1 auto !important;
+    min-width: 0;
+  }
+
+  .setting__label {
+    font-size: 14px;
+    line-height: 1.45;
+  }
+
+  .setting__hint {
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .setting__control {
+    flex: 1 1 auto !important;
+    min-width: 0;
+    max-width: 100%;
+    display: flex !important;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    margin: 0;
+  }
+
+  /* 第二行的控件要能长开：输入框 / 下拉 / 文本域一律 flex 拉伸并允许收缩 */
+  .setting__control > input,
+  .setting__control > select,
+  .setting__control > textarea,
+  .setting__control > .input,
+  .setting__control > .select {
+    flex: 1 1 160px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .setting__control > .btn {
+    flex: 0 1 auto;
+  }
+
+  .setting__control > .switch,
+  .setting__control > .checkbox,
+  .setting__control > .radio {
+    flex: none;
+  }
+
+  .setting__warn {
+    margin: 0 var(--m-gutter) 10px !important;
+  }
+
+  /* 路径行同理：路径整行 + 按钮另起一行 */
+  .pathrow {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 8px !important;
+    padding: 12px 0 !important;
+    background: none !important;
+    border: 0 !important;
+  }
+
+  .pathrow__path {
+    font-size: 13px;
+    word-break: break-all;
+  }
+
+  .card__actions {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+
+  .card__actions .btn,
+  .card__foot .btn {
+    height: 38px;
+    border-radius: 999px;
+    padding: 0 14px;
+  }
+
+  .chip {
+    height: 22px;
+    border-radius: 999px;
+    font-size: 11px;
+  }
+
+  /* —— 分类首页（android.js 注入） —— */
+  .settings-layer:not([data-msec]) .card[data-section] {
+    display: none;
+  }
+
+  .m-set-home {
+    display: block;
+    padding: 6px 0 18px;
+  }
+
+  .m-set-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    height: 60px;
+    padding: 0 var(--m-gutter);
+    border: 0;
+    border-bottom: 1px solid var(--m-line);
+    background: none;
+    color: var(--text-1);
+    font-size: 15px;
+    text-align: left;
+  }
+
+  .m-set-item:active {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .m-set-item__icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--accent, #4c8dff);
+  }
+
+  .m-set-item__icon svg {
+    width: 19px;
+    height: 19px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+  }
+
+  .m-set-item__label {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .m-set-item__chev {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+  }
+
+  .m-set-hint {
+    padding: 14px var(--m-gutter) 6px;
+    color: var(--text-3);
+    font-size: 12px;
+  }
+
+  .settings-layer[data-msec] .settings-layer__icon {
+    display: none;
+  }
+
+  /* 进了分区就把分类首页整块收起 —— 两者不该同时出现在一屏 */
+  .settings-layer[data-msec] .m-set-home {
+    display: none !important;
+  }
+
+  .settings-layer[data-msec] .card[data-section] {
+    display: none;
+  }
+
+  .settings-layer[data-msec="library"] .card[data-section="library"],
+  .settings-layer[data-msec="player"] .card[data-section="player"],
+  .settings-layer[data-msec="ui"] .card[data-section="ui"],
+  .settings-layer[data-msec="data"] .card[data-section="data"],
+  .settings-layer[data-msec="ai"] .card[data-section="ai"],
+  .settings-layer[data-msec="about"] .card[data-section="about"] {
+    display: block;
+  }
+
+  /* 分区切换的进场：短距离滑入（不是淡入淡出）。
+     用 animation 而不是 transition —— 分区是用 display 切的，
+     transition 抓不到起始帧。 */
+  @keyframes m-set-in {
+    from {
+      opacity: 0.4;
+      transform: translate3d(18px, 0, 0);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .settings-layer[data-msec] .card[data-section] {
+    animation: m-set-in 0.2s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  }
+
+  /* 桌面右上角的 × 在手机上由左侧返回箭头代替（两套「退一级」不能并存） */
+  .settings-layer__close {
+    display: none !important;
+  }
+
+  /* 返回箭头（注入在标题左边）：分区里退一级，根页直接关掉设置页 */
+  .m-set-back {
+    display: grid;
+    width: var(--m-tap);
+    height: var(--m-tap);
+    place-items: center;
+    border: 0;
+    border-radius: 14px;
+    background: none;
+    color: var(--text-1);
+  }
+
+  .settings-layer[data-msec] .m-set-back {
+    display: grid;
+  }
+
+  .m-set-back svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+  }
+
+  .m-set-back:active {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  /* ============================================ 其余浮层：底部 sheet / 全屏 */
+  .queue-panel,
+  .options-panel,
+  .sleep-panel,
+  .download-panel {
+    left: 8px !important;
+    right: 8px !important;
+    width: auto !important;
+    max-width: none !important;
+    bottom: calc(var(--h-playerbar) + 8px) !important;
+    max-height: min(70vh, 620px) !important;
+    border-radius: 20px !important;
+  }
+
+  body[data-pv="1"] .queue-panel,
+  body[data-pv="1"] .options-panel,
+  body[data-pv="1"] .sleep-panel,
+  body[data-pv="1"] .download-panel {
+    bottom: calc(190px + var(--m-safe-b) + 8px) !important;
+  }
+
+  .queue-panel__head,
+  .options-panel__head,
+  .sleep-panel__head {
+    padding: 10px 14px;
+  }
+
+  .queue-item {
+    min-height: 56px;
+    padding: 8px 14px;
+    gap: 10px;
+  }
+
+  .queue-item__del {
+    opacity: 1;
+  }
+
+  .opt {
+    min-height: 56px;
+    padding: 10px 14px;
+    gap: 10px;
+  }
+
+  /* 歌词面板：手机上整页 */
+  .lyrics-panel,
+  .lyricspanel {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    height: 100% !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+    z-index: 9650;
+    padding-top: 0;
+  }
+
+  /* 封面层（更换封面 / 轮播）同样整页 */
+  .cover-layer {
+    inset: 0 !important;
+    z-index: 9660;
+  }
+
+  .cover-layer__panel {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    border-radius: 0;
+    border: 0;
+    padding-top: 0;
+  }
+
+  /* 桌面右上角的队列/歌词浮按钮组在手机上不需要 */
+  .floating-tools,
+  .app-tools {
+    display: none !important;
+  }
+
+  /* 过滤规则：桌面这行是 6 列网格，手机放不下，改成可换行 flex */
+  .rule {
+    display: flex !important;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 0;
+    grid-template-columns: none !important;
+  }
+
+  .rule > .switch {
+    order: -1;
+  }
+
+  .rule__field,
+  .rule__op {
+    flex: 1 1 44%;
+    height: 38px;
+    min-width: 0;
+  }
+
+  .rule__value {
+    flex: 1 1 100%;
+    height: 38px;
+    min-width: 0;
+  }
+
+  .rule__scope {
+    flex: 1 1 auto;
+  }
+
+  .rule__scope-btn {
+    height: 38px;
+  }
+
+  /* ============================================================ 搜索（整页） */
+  /* 桌面上是「居中卡片 + 遮罩」，手机上改成整页：分段（在线/本地）在顶、
+     输入框其下、结果占满剩余高度。 */
+  .search-overlay {
+    inset: 0 !important;
+    padding: 0 !important;
+    background: var(--bg-app, #0b0b0f) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    z-index: 9680 !important;
+  }
+
+  .search-overlay__panel {
+    width: 100% !important;
+    max-width: none !important;
+    height: 100% !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    display: flex;
+    flex-direction: column;
+    padding-top: 0;
+  }
+
+  .search-overlay__head {
+    flex: none;
+    height: 56px;
+    padding: 0 8px 0 6px;
+    border-bottom: 0;
+  }
+
+  .search-overlay__title {
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .search-overlay__close {
+    width: var(--m-tap);
+    height: var(--m-tap);
+    border-radius: 14px;
+  }
+
+  .search-overlay__search {
+    flex: none;
+    padding: 0 var(--m-gutter) 8px;
+  }
+
+  .search-field,
+  .search-overlay__field,
+  .search-overlay input[type="search"],
+  .search-overlay input[type="text"] {
+    height: 44px;
+    font-size: 15px;
+    border-radius: 14px;
+  }
+
+  .search-overlay__history {
+    flex: none;
+    padding: 0 var(--m-gutter) 8px;
+  }
+
+  .search-overlay__status {
+    flex: none;
+    padding: 0 var(--m-gutter) 6px;
+  }
+
+  .search-overlay__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 0 var(--m-gutter) calc(16px + var(--m-safe-b));
+    overscroll-behavior: contain;
+  }
+
+  .search-row {
+    min-height: 60px;
+    padding: 8px 0;
+  }
+
+  /* 在线 / 本地 分段（android.js 注入） */
+  .m-seg {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    padding: 0 var(--m-gutter) 10px;
+  }
+
+  .m-seg__btn {
+    flex: 1 1 0;
+    height: 38px;
+    border: 0;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-2, rgba(244, 244, 246, 0.66));
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  .m-seg__btn[aria-selected="true"] {
+    background: var(--accent, #4c8dff);
+    color: #fff;
+  }
+
+  /* 本地结果列表（android.js 自己渲染，样式独立于在线结果） */
+  #m-local-results {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0 var(--m-gutter) calc(16px + var(--m-safe-b));
+  }
+
+  .search-overlay[data-mmode="local"] #search-body,
+  .search-overlay[data-mmode="local"] #search-history,
+  .search-overlay[data-mmode="local"] .search-overlay__status {
+    display: none !important;
+  }
+
+  .search-overlay:not([data-mmode="local"]) #m-local-results {
+    display: none !important;
+  }
+
+  .m-res {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    height: 64px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-1);
+    text-align: left;
+    border-bottom: 1px solid var(--m-line);
+  }
+
+  .m-res:active {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .m-res__cover {
+    flex: none;
+    width: 48px;
+    height: 48px;
+    border-radius: 10px;
+    object-fit: cover;
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .m-res__meta {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .m-res__title {
+    font-size: 15px;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .m-res__sub {
+    font-size: 12.5px;
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .m-res__time {
+    flex: none;
+    font-size: 12px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .m-res-empty {
+    padding: 40px 0;
+    text-align: center;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+
+  /* 播放栏上滑进详情页：必须自己接管垂直方向的手势。
+     否则 WebView 在第一个 touchmove 之前就判定为"页面滚动"，
+     后面的 touchmove 变成 touchcancel，手势整段丢给浏览器 ——
+     表现就是「上滑没反应」。横滑仍留给工具行（pan-x）。 */
+  .playerbar {
+    touch-action: none;
+  }
+
+  .playerbar__tools,
+  .playerbar__progress,
+  .playerbar__now {
+    touch-action: pan-x;
+  }
+
+  /* 贴底 sheet 的把手与头部同理：从这里起手就是拖拽关闭，不是滚动 */
+  .m-grip,
+  .menu__head,
+  .queue-panel__head,
+  .options-panel__head,
+  .sleep-panel__head,
+  .download-panel__head {
+    touch-action: none;
+  }
+
+  /* ============================================ 贴底 sheet 的拖拽把手 */
+  /* 手机上没有「点空白处关闭」这种从容操作，贴底 sheet 必须能往下拖掉。
+     把手同时也是可拖的提示 —— 看到它就知道这块能拖。 */
+  .m-grip {
+    flex: none;
+    display: block;
+    width: 36px;
+    height: 4px;
+    margin: 8px auto 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.26);
+    pointer-events: none;
+  }
+
+  /* 拖拽中必须禁掉过渡，否则元素会「追手指」 */
+  .m-drag {
+    transition: none !important;
+  }
+
+  /* ================================== 播放页转场用的封面替身（共享元素） */
+  /* 挂在面板内部、摆在舞台封面那个槽位上，只做缩放 —— 于是它天然跟着面板
+     一起走，不会出现「封面飘到面板外面」的错位。 */
+  .m-pv-ghost {
+    position: absolute;
+    z-index: 5;
+    margin: 0;
+    padding: 0;
+    border-radius: 10px;
+    /* 以中心缩放：槽位就是终态尺寸，缩到 k 倍即「播放栏封面那么大」 */
+    transform-origin: 50% 50%;
+    object-fit: cover;
+    pointer-events: none;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+    backface-visibility: hidden;
+  }
+}
+
+/* 窄屏（<=380dp）再收一档字号与内边距 */
+@media (max-width: 380px) {
+  :root {
+    --m-gutter: 12px;
+  }
+
+  .track {
+    grid-template-columns: 48px minmax(0, 1fr) auto 40px !important;
+    column-gap: 10px !important;
+  }
+
+  .track__cover {
+    width: 48px;
+    height: 48px;
+  }
+
+  .playerbar {
+    grid-template-columns: 52px minmax(0, 1fr) 48px 44px;
+  }
+
+  #bar-cover {
+    width: 48px;
+    height: 48px;
+  }
+}

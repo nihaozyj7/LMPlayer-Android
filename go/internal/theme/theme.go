@@ -1,0 +1,486 @@
+// Package theme 负责主题发现与自定义主题加载（需求 A8：用户丢一个 CSS 文件即可用）。
+//
+// 主题 = 一个只声明设计令牌的 CSS 文件。为了让程序能读到中文主题名、
+// 深浅模式与色板缩略图，约定在文件头的注释里写少量指令，例如：
+//
+//	/* @theme-name 深色 · 黑白极简
+//	   @theme-mode dark
+//	   @theme-swatch #08080a #1b1b1f #3a3a42 #f4f4f6 #ff4d6d */
+//
+// 没有指令也能用：此时名称取文件名，模式按文件名里的 light/浅色 猜测，
+// 色板从文件中的颜色字面量里取前 5 个。
+package theme
+
+import (
+	"embed"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+//go:embed builtin/*.css
+var builtinFS embed.FS
+
+// Info 主题元信息（与前端 ThemeInfo 对应）
+type Info struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Mode    string   `json:"mode"`
+	Swatch  []string `json:"swatch"`
+	Builtin bool     `json:"builtin"`
+	File    string   `json:"-"`
+}
+
+// Manager 主题目录管理
+//
+// byID / order 会被 Reload 整表替换，而 List / CSS / BuiltinIDs 可能在同一时刻
+// 被另一个 goroutine 读到（最典型的是 /early-theme.js 的 handler 与设置页的
+// 「重新扫描」并发）。无锁读写 Go 的 map 不是数据错乱，是**直接崩溃**，
+// 所以这里必须加 RWMutex —— 读多写少，RWMutex 的开销可以忽略。
+type Manager struct {
+	mu    sync.RWMutex
+	dir   string
+	byID  map[string]Info
+	order []string
+}
+
+var (
+	reThemeName = regexp.MustCompile(`@theme-name\s+(.+)`)
+	// reBuiltinRev 读内置主题头里的修订号（见 theme.go 顶部说明与 syncBuiltin）
+	reBuiltinRev  = regexp.MustCompile(`@theme-builtin-rev\s+(\d+)`)
+	reThemeMode   = regexp.MustCompile(`@theme-mode\s+(\w+)`)
+	reThemeSwatch = regexp.MustCompile(`@theme-swatch\s+([^\r\n*]+)`)
+	reColorHex    = regexp.MustCompile(`#[0-9a-fA-F]{3,8}`)
+	reRootSel     = regexp.MustCompile(`:root\[data-theme="([^"]+)"\]`)
+)
+
+// NewManager 准备主题目录：把内置主题写入用户目录（用户可自由改），然后扫描
+func NewManager(dataDir string) (*Manager, error) {
+	dir := filepath.Join(dataDir, "themes")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("创建主题目录失败: %w", err)
+	}
+
+	m := &Manager{dir: dir, byID: map[string]Info{}}
+	if err := m.syncBuiltin(); err != nil {
+		return nil, err
+	}
+	if err := m.Reload(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// Dir 主题目录（供「打开主题文件夹」使用）
+func (m *Manager) Dir() string { return m.dir }
+
+// builtinRev 读一段主题 CSS 里的内置修订号；没有标记时返回 0。
+func builtinRev(css string) int {
+	m := reBuiltinRev.FindStringSubmatch(css)
+	if len(m) != 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// syncBuiltin 把内置主题写入用户目录。
+//
+// 为什么不是「存在就跳过」：内置主题是**程序的一部分**，它的观感会随版本改进
+// （例如整窗渐变底 + 磨砂面板那一版）。用户目录里躺着旧副本时，前端
+// discoverThemes 会把旧 CSS 注入成独立样式表，而它排在打包样式表之后 ——
+// 结果是「程序升级了，主题却一点没变」。
+//
+// 做法：内置主题文件头带一个 @theme-builtin-rev 修订号。
+//
+//	· 目标文件不存在            → 写入；
+//	· 目标修订号 >= 内置修订号  → 跳过（同一版，或用户自己维护的副本）；
+//	· 目标修订号更小            → 覆盖成新版，覆盖前先留一份 .bak。
+//
+// 一条边界：**从没有修订号的旧文件**（比这个机制更早的版本）修订号按 0 算，
+// 会被升级一次；升级前的那份会写到 <名字>.css.bak，用户真的改过也能找回来。
+// 想长期自定义内置主题仍然可以：把文件复制成别的名字即可（新名字不受管理）。
+func (m *Manager) syncBuiltin() error {
+	entries, err := builtinFS.ReadDir("builtin")
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".css") {
+			continue
+		}
+		data, err := builtinFS.ReadFile("builtin/" + e.Name())
+		if err != nil {
+			continue
+		}
+		target := filepath.Join(m.dir, e.Name())
+		want := builtinRev(string(data))
+
+		if existing, readErr := os.ReadFile(target); readErr == nil {
+			// want == 0 说明这个内置文件本身没有修订标记：保持旧行为，不覆盖。
+			if want == 0 || builtinRev(string(existing)) >= want {
+				continue
+			}
+			if err := os.WriteFile(target+".bak", existing, 0o644); err != nil {
+				fmt.Printf("[theme] 备份旧内置主题失败 %s: %v\n", target, err)
+			}
+		}
+
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			return fmt.Errorf("写入内置主题失败: %w", err)
+		}
+	}
+	return m.dropRetiredBuiltins()
+}
+
+// dropRetiredBuiltins 把「已移除的内置主题」留在用户目录里的旧副本移走。
+//
+// 判据（见 retiredBuiltins 的注释）：文件名匹配退役名单，且文件里写着
+// @theme-builtin-rev（> 0）—— 那就是我们自己写下去的那一份。用户改过名字
+// （不受管理）、或把修订号那行删掉（= 比这套机制更早的副本 / 自己另存的稿子）
+// 都**不动**。删除前写 .bak，和覆盖旧内置主题的做法保持一致。
+func (m *Manager) dropRetiredBuiltins() error {
+	for id := range retiredBuiltins {
+		if _, stillBuiltin := builtinIDs[id]; stillBuiltin {
+			// 名单里又加回来了（比如换个版本重新分发）：别删，交给上面的同步逻辑。
+			continue
+		}
+		target := filepath.Join(m.dir, id+".css")
+		existing, err := os.ReadFile(target)
+		if err != nil {
+			continue // 没这份文件是常态（新装 / 已经清过）
+		}
+		if builtinRev(string(existing)) <= 0 {
+			continue // 不是我们写的那一份
+		}
+		if err := os.WriteFile(target+".bak", existing, 0o644); err != nil {
+			fmt.Printf("[theme] 备份退役内置主题失败 %s: %v\n", target, err)
+		}
+		if err := os.Remove(target); err != nil {
+			return fmt.Errorf("移除退役内置主题 %s 失败: %w", id, err)
+		}
+		fmt.Printf("[theme] 已移除不再随程序分发的内置主题 %s\n", id)
+	}
+	return nil
+}
+
+// Reload 重新扫描主题目录
+func (m *Manager) Reload() error {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return fmt.Errorf("读取主题目录失败: %w", err)
+	}
+
+	byID := map[string]Info{}
+	order := []string{}
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".css") {
+			continue
+		}
+		name := e.Name()
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		if strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".") {
+			continue // 模板文件与隐藏文件不参与
+		}
+		raw, err := os.ReadFile(filepath.Join(m.dir, name))
+		if err != nil {
+			continue
+		}
+		info := parseTheme(base, string(raw))
+		info.File = filepath.Join(m.dir, name)
+		byID[info.ID] = info
+		order = append(order, info.ID)
+	}
+
+	// 内置主题优先排在前面，其余按名称排序
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := byID[order[i]], byID[order[j]]
+		if a.Builtin != b.Builtin {
+			return a.Builtin
+		}
+		return a.ID < b.ID
+	})
+
+	// 整表替换必须在锁里：/early-theme.js 的 handler 会在任意时刻调 List()，
+	// 而设置页的「重新扫描」会调 Reload()。无锁时并发读 map 会直接
+	// fatal error: concurrent map read and map write（不是数据错乱，是崩溃）。
+	m.mu.Lock()
+	m.byID = byID
+	m.order = order
+	m.mu.Unlock()
+	return nil
+}
+
+// List 返回全部主题（按顺序）
+func (m *Manager) List() []Info {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Info, 0, len(m.order))
+	for _, id := range m.order {
+		out = append(out, m.byID[id])
+	}
+	return out
+}
+
+// CSS 读取主题 CSS 原文
+func (m *Manager) CSS(id string) (string, error) {
+	m.mu.RLock()
+	info, ok := m.byID[id]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("主题不存在: %s", id)
+	}
+	raw, err := os.ReadFile(info.File)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// OpenFolderPath 返回主题目录（供资源管理器打开）
+func (m *Manager) OpenFolderPath() string { return m.dir }
+
+// ImportResult 一次「从文件夹导入主题」的结果。
+//
+// Imported 给出真正落地的主题 id（取自 :root[data-theme="…"]，与文件名不一定相同）；
+// Skipped 逐条说明哪个文件为什么没进来（模板、隐藏文件、缺选择器…），
+// 让前端能把「导入了 0 个」讲清楚，而不是只报一句失败。
+type ImportResult struct {
+	Imported []string `json:"imported"`
+	Skipped  []string `json:"skipped"`
+}
+
+// ImportDir 把用户选中的文件夹里的主题 CSS 复制进主题目录。
+//
+// 合法性判定：文件夹里至少有一个 .css，且该文件里出现
+// :root[data-theme="…"] 选择器 —— 主题本来就只声明这组令牌，
+// 随手选到图片文件夹 / 空白目录会被明确挡下来。
+// 只导入一层（主题目录是平的，不支持嵌套子目录）。
+func (m *Manager) ImportDir(src string) (ImportResult, error) {
+	res := ImportResult{Imported: []string{}, Skipped: []string{}}
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return res, fmt.Errorf("没有选择文件夹")
+	}
+	st, err := os.Stat(src)
+	if err != nil || !st.IsDir() {
+		return res, fmt.Errorf("不是有效的文件夹：%s", src)
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return res, fmt.Errorf("读取文件夹失败：%w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".css") {
+			continue
+		}
+		name := e.Name()
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		if strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".") {
+			res.Skipped = append(res.Skipped, name+"（模板 / 隐藏文件不参与导入）")
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(src, name))
+		if err != nil {
+			res.Skipped = append(res.Skipped, name+"（读不到文件）")
+			continue
+		}
+		sel := reRootSel.FindSubmatch(raw)
+		if len(sel) != 2 {
+			res.Skipped = append(res.Skipped, name+"（缺少 :root[data-theme=\"…\"] 选择器，不像主题）")
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(m.dir, name), raw, 0o644); err != nil {
+			res.Skipped = append(res.Skipped, name+"（写入失败："+err.Error()+"）")
+			continue
+		}
+		res.Imported = append(res.Imported, string(sel[1]))
+	}
+	switch {
+	case len(res.Imported) > 0:
+		if err := m.Reload(); err != nil {
+			return res, err
+		}
+		return res, nil
+	case len(res.Skipped) > 0:
+		return res, fmt.Errorf("没有导入任何主题：%s", strings.Join(res.Skipped, "；"))
+	default:
+		// 用户可能选中了「装着主题的子文件夹」的外层目录：这时明确指出往里一层，
+		// 比只回一句「没有 .css」有用。
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			names, err := os.ReadDir(filepath.Join(src, e.Name()))
+			if err != nil {
+				continue
+			}
+			for _, n := range names {
+				if !n.IsDir() && strings.HasSuffix(strings.ToLower(n.Name()), ".css") {
+					return res, fmt.Errorf("文件夹里没有 .css 主题文件；主题在子文件夹「%s」里，请选中它再导入", e.Name())
+				}
+			}
+		}
+		return res, fmt.Errorf("文件夹里没有 .css 主题文件")
+	}
+}
+
+// Delete 删除一个用户主题（只删主题目录里的那一个 CSS 文件）。
+//
+// 为什么内置主题不允许删：它们是**每次启动时**由 syncBuiltin 从二进制里补写到
+// 主题目录的，删掉只会在下次启动又冒出来。与其让用户看到「删了又回来」，
+// 不如在这里直接说清楚。
+//
+// 删除之后立刻重扫一遍：列表是「磁盘的真话」，不重扫就会出现
+// 「文件删了、界面还在」——这正是本方法要修掉的问题。
+func (m *Manager) Delete(id string) error {
+	key := strings.TrimSpace(id)
+	m.mu.RLock()
+	info, ok := m.byID[key]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("主题不存在: %s", id)
+	}
+	if info.Builtin {
+		return fmt.Errorf("「%s」是内置主题，程序每次启动都会重新生成，不能删除", info.Name)
+	}
+	if strings.TrimSpace(info.File) == "" {
+		return fmt.Errorf("主题 %s 没有对应的文件", id)
+	}
+	// 双保险：只允许删主题目录里的文件。File 是扫描时自己拼出来的，
+	// 正常不会跑到目录外，但删除是不可撤销的动作，值得再确认一次。
+	if !withinDir(m.dir, info.File) {
+		return fmt.Errorf("拒绝删除主题目录之外的文件: %s", info.File)
+	}
+	if err := os.Remove(info.File); err != nil {
+		return fmt.Errorf("删除主题失败: %w", err)
+	}
+	return m.Reload()
+}
+
+// withinDir 判断 target 是否落在 dir 之内（相等也算）。
+func withinDir(dir, target string) bool {
+	rel, err := filepath.Rel(dir, target)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// BuiltinIDs 内置主题 id 列表
+func (m *Manager) BuiltinIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := []string{}
+	for _, id := range m.order {
+		if m.byID[id].Builtin {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+/* --------------------------------------------------------------------------
+   解析
+   -------------------------------------------------------------------------- */
+
+var builtinIDs = map[string]string{
+	"flat-dark":  "简约深色",
+	"flat-light": "简约浅色",
+	"cover-dark": "封面取色 · 深色",
+}
+
+// retiredBuiltins 是**已经从程序里移除**的内置主题 id。
+//
+// 为什么需要它：内置主题会被 syncBuiltin 复制一份到用户主题目录，而扫描认的是
+// 「目录里有什么」，不认「是不是还随程序分发」。不移走的话，删掉的内置主题会
+// 以**用户主题**的身份继续出现在主题列表里（能选中、能删、名字还是内置那个），
+// 也就是「删了等于没删」。
+//
+// 判据只看「文件名 + 文件里有没有 @theme-builtin-rev」：同一个名字又带着我们的
+// 修订号，那就是程序自己写下去的那一份。**不比较修订号大小** —— 磁盘上的副本
+// 可能来自更新（或更旧）的版本，比这里记的新是常态（实测本机就是 rev 4，
+// 而仓库里最后一版是 rev 3）；按大小判断会把这种最常见的副本放过去。
+//
+// 与既有约定一致：想长期自定义内置主题要**换个文件名**（见 syncBuiltin 的注释），
+// 同名文件本来就是受管理的。删除前留一份 .bak。
+var retiredBuiltins = map[string]bool{
+	"dark-minimal":  true,
+	"light-minimal": true,
+}
+
+// IsBuiltinID 判断 id 是否为内置主题。
+//
+// 内置主题的**名单**只有 builtinIDs 这一处，不要再往调用方抄一份 id 列表：
+// early_theme.go 曾经自己维护过一个 switch，新增内置主题时漏改就会让
+// 「首帧主题」认不出它，表现为启动时先闪一下默认深色再切过来。
+func IsBuiltinID(id string) bool {
+	_, ok := builtinIDs[strings.TrimSpace(id)]
+	return ok
+}
+
+func parseTheme(base, css string) Info {
+	info := Info{ID: base, Name: base, Mode: guessMode(base, css), Swatch: []string{}}
+
+	// 选择器里的 data-theme 值优先作为 id（保证与实际生效的选择器一致）
+	if m := reRootSel.FindStringSubmatch(css); len(m) == 2 {
+		info.ID = m[1]
+	}
+	if name, ok := builtinIDs[info.ID]; ok {
+		info.Builtin = true
+		info.Name = name
+	}
+
+	if m := reThemeName.FindStringSubmatch(css); len(m) == 2 {
+		info.Name = strings.TrimSpace(m[1])
+	}
+	if m := reThemeMode.FindStringSubmatch(css); len(m) == 2 {
+		info.Mode = strings.ToLower(strings.TrimSpace(m[1]))
+	}
+	if m := reThemeSwatch.FindStringSubmatch(css); len(m) == 2 {
+		for _, c := range strings.Fields(m[1]) {
+			if strings.HasPrefix(c, "#") {
+				info.Swatch = append(info.Swatch, c)
+			}
+		}
+	}
+	if len(info.Swatch) == 0 {
+		seen := map[string]bool{}
+		for _, c := range reColorHex.FindAllString(css, 40) {
+			lc := strings.ToLower(c)
+			if seen[lc] || len(lc) < 4 {
+				continue
+			}
+			seen[lc] = true
+			info.Swatch = append(info.Swatch, c)
+			if len(info.Swatch) == 5 {
+				break
+			}
+		}
+	}
+	return info
+}
+
+func guessMode(base, css string) string {
+	l := strings.ToLower(base)
+	if strings.Contains(l, "light") || strings.Contains(base, "浅色") {
+		return "light"
+	}
+	if strings.Contains(l, "dark") || strings.Contains(base, "深色") {
+		return "dark"
+	}
+	if m := reThemeMode.FindStringSubmatch(css); len(m) == 2 {
+		return strings.ToLower(strings.TrimSpace(m[1]))
+	}
+	return "dark"
+}

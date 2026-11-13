@@ -1,0 +1,20 @@
+[
+  "services.go",
+  "services_ai.go",
+  "services_app.go",
+  "services_cover.go",
+  "services_download.go",
+  "services_online.go",
+  "services_packs.go",
+  "services_player.go",
+  "services_reference.go",
+  "services_skins.go",
+  "services_unplayable.go",
+  "ai_tags.go",
+  "ai_vendor.go",
+  "lyrics_meta.go",
+  "online_wiring.go",
+  "online_cache_cleanup.go",
+  "byte_pipe.go",
+  "http_stream_client.go"
+]

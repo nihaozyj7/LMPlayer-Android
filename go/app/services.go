@@ -1,0 +1,2027 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"localmusicplayer/internal/bootstrap"
+	"localmusicplayer/internal/executil"
+	"localmusicplayer/internal/library"
+	"localmusicplayer/internal/loudness"
+	"localmusicplayer/internal/lyrics"
+	"localmusicplayer/internal/media"
+	"localmusicplayer/internal/metacache"
+	"localmusicplayer/internal/theme"
+)
+
+// ---------------------------------------------------------------------------
+// Library 服务：音乐文件夹、扫描、歌曲列表
+// ---------------------------------------------------------------------------
+
+// LibraryService 曲库相关的前端接口
+type LibraryService struct {
+	lib   *library.Manager
+	watch *library.Watcher
+	store *bootstrap.Store
+	app   *application.App
+
+	// OnScanFinished 每次后台扫描结束时调用（仅用于测试同步，生产环境为 nil）
+	OnScanFinished func()
+}
+
+// NewLibraryService 构造服务（app 由 main 在创建应用后注入）
+func NewLibraryService(lib *library.Manager, watch *library.Watcher, store *bootstrap.Store) *LibraryService {
+	s := &LibraryService{lib: lib, watch: watch, store: store}
+	// 曲库的每一次变化都在这里统一广播 scan:done：
+	//   · 全量扫描（用户点重扫 / 添加文件夹 / 启动扫描）；
+	//   · 增量扫描（文件夹监听、下载完成后 onFileAdded 调用的 RescanPaths）。
+	// 下载入库走的就是第二条 —— 以前只更新了内存里的 songs，没人告诉前端，
+	// 于是「刚下载的歌要重启才出现」。emit 会自己判断 app 是否就绪，
+	// 所以此时（app 还没注入）注册回调是安全的。
+	if lib != nil {
+		lib.SetChangedFunc(func(res library.ScanResult) {
+			s.emit("scan:done", res)
+		})
+	}
+	return s
+}
+
+// ToggleLike 切换「我喜欢」状态，返回切换后的状态
+func (s *LibraryService) ToggleLike(songID string) (bool, error) {
+	if strings.TrimSpace(songID) == "" {
+		return false, errors.New("歌曲 id 为空")
+	}
+	liked := false
+	err := s.store.Update(func(c *bootstrap.Config) {
+		for i, id := range c.LikedIDs {
+			if id == songID {
+				c.LikedIDs = append(c.LikedIDs[:i:i], c.LikedIDs[i+1:]...)
+				liked = false
+				return
+			}
+		}
+		c.LikedIDs = append(c.LikedIDs, songID)
+		liked = true
+	})
+	return liked, err
+}
+
+// Songs 返回过滤后的全部歌曲
+func (s *LibraryService) Songs() []bootstrap.Song {
+	return s.lib.Songs()
+}
+
+// Folders 返回**用户配置的**音乐文件夹（给设置界面用）。
+//
+// ★ 刻意不返回隐式下载根（bootstrap.DownloadFolderID）：它是程序管理的
+// 「下载目录」的一种派生形态（见 bootstrap.Config.EffectiveFolders），
+// 不是用户添加的文件夹。把它混进来会有两个后果：
+//   - 设置界面的文件夹列表里冒出一条用户从没添加过的路径；
+//   - 那条路径的「移除」按钮永远失败（它不在 config.Folders 里，删不掉），
+//     用户看到的是一个删不掉、又不认识的行。
+//
+// 曲库真正扫描哪些根仍然由 EffectiveFolders 决定（含下载目录），与本方法无关。
+func (s *LibraryService) Folders() []bootstrap.Folder {
+	all := s.lib.Folders()
+	out := make([]bootstrap.Folder, 0, len(all))
+	for _, f := range all {
+		if f.ID == bootstrap.DownloadFolderID {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+/* --------------------------------------------------------------------------
+   曲库移除 / 反查（给 UnplayableService 用，见 services_unplayable.go）
+   -------------------------------------------------------------------------- */
+
+// DropSong 把一首歌从曲库里摘掉（不动磁盘文件）。
+//
+// 刻意**不导出**成 Wails 绑定：它是给 UnplayableService 用的内部能力，
+// 前端不该有「凭 id 删任意一首歌」的入口 —— 曲库的增删只应由扫描决定。
+func (s *LibraryService) DropSong(songID string) bool {
+	return s.lib.DropSong(songID)
+}
+
+// LookupSong 按 id 反查路径/标题/歌手/扩展名。
+//
+// 同样刻意不导出：前端拿到的歌曲对象里本来就有这些字段，
+// 这个方法只是让后端服务之间能互相补齐信息。
+func (s *LibraryService) LookupSong(songID string) (path, title, artist, ext string, ok bool) {
+	song, found := s.lib.SongByID(songID)
+	if !found {
+		return "", "", "", "", false
+	}
+	return song.Path, song.Title, song.Artist, song.Ext, true
+}
+
+// Scan 扫描指定文件夹（folderIds 为空表示全部）。
+// 立即返回是否成功启动，实际进度通过 scan:progress / scan:done 事件推送。
+// Scan 启动一次异步全量扫描。
+// 返回 started=true 表示本次调用确实会跑一次扫描并最终发出 scan:done 事件。
+// 注意：曲库内部会把并发的扫描请求排队（而不是丢弃），因此这里恒为 true，
+// 前端只需等 scan:done 即可，不会出现「等不到事件」的情况。
+func (s *LibraryService) Scan(folderIDs []string) map[string]any {
+	s.emit("scan:start", map[string]any{"folderIds": folderIDs})
+	s.lib.SetProgressFunc(func(phase string, current, total int) {
+		s.emit("scan:progress", map[string]any{"phase": phase, "current": current, "total": total})
+	})
+
+	go s.runScan(30 * time.Minute)
+
+	return map[string]any{"started": true}
+}
+
+// runScan 在后台跑一次全量扫描并广播结果（供 Scan / AddFolder 共用）
+func (s *LibraryService) runScan(timeout time.Duration) {
+	defer func() {
+		if s.OnScanFinished != nil {
+			s.OnScanFinished()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := s.lib.Scan(ctx, false); err != nil {
+		s.emit("scan:failed", map[string]any{"message": err.Error()})
+		return
+	}
+	// scan:done 由 NewLibraryService 注册的 SetChangedFunc 统一发出
+	// （Scan 内部的 notifyChanged 会带上这次的 ScanResult），这里不再重复发送。
+}
+
+// AddFolder 弹出系统目录选择器并添加；用户取消时返回 cancelled=true。
+// manualPath 非空时直接使用该路径（用于手输路径或自动化测试）。
+func (s *LibraryService) AddFolder(manualPath string) (map[string]any, error) {
+	path := strings.TrimSpace(manualPath)
+
+	if path == "" {
+		selected, err := s.pickDirectory()
+		if err != nil {
+			return nil, err
+		}
+		if selected == "" {
+			return map[string]any{"cancelled": true}, nil
+		}
+		path = selected
+	}
+
+	clean, err := library.ValidateFolder(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// 去重（同一目录不重复添加）
+	for _, f := range s.lib.Folders() {
+		if strings.EqualFold(f.Path, clean) {
+			return map[string]any{"duplicated": true, "path": clean}, nil
+		}
+	}
+
+	folder := bootstrap.Folder{
+		ID:         bootstrap.StableID(clean, "folder"),
+		Path:       clean,
+		Status:     "ok",
+		Watching:   s.store.Get().WatchFolders,
+		AddedAt:    time.Now().UnixMilli(),
+		TrackCount: 0,
+	}
+	if err := s.store.Update(func(c *bootstrap.Config) {
+		c.Folders = append(c.Folders, folder)
+	}); err != nil {
+		return nil, err
+	}
+
+	// 让曲库立刻看到新文件夹（Manager 自己缓存了一份 folders 副本）
+	s.lib.ReloadFolders()
+
+	// 立刻生效：重新登记监听 + 走和「重新扫描」完全一致的扫描流程，
+	// 这样前端收到的 scan:start / scan:progress / scan:done 事件顺序一致。
+	s.refreshWatcher()
+	s.emit("scan:start", map[string]any{"folderIds": []string{folder.ID}})
+	go s.runScan(10 * time.Minute)
+
+	return map[string]any{"folder": folder}, nil
+}
+
+// RemoveFolder 移除音乐文件夹（不动本地文件）
+func (s *LibraryService) RemoveFolder(id string) error {
+	var removed bool
+	if err := s.store.Update(func(c *bootstrap.Config) {
+		next := make([]bootstrap.Folder, 0, len(c.Folders))
+		for _, f := range c.Folders {
+			if f.ID == id {
+				removed = true
+				continue
+			}
+			next = append(next, f)
+		}
+		c.Folders = next
+	}); err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("文件夹不存在: %s", id)
+	}
+	s.refreshWatcher()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// cancel 必须在 goroutine 里 defer：放在外面的话函数一 return 就把刚交给
+	// 后台的 ctx 取消了，扫描必然以「context canceled」失败并弹一条红色 toast。
+	go func() {
+		defer cancel()
+		if _, err := s.lib.Scan(ctx, false); err != nil {
+			s.emit("scan:failed", map[string]any{"message": err.Error()})
+		}
+	}()
+	return nil
+}
+
+// SetWatchers 开/关文件夹实时监听
+func (s *LibraryService) SetWatchers(enabled bool) error {
+	if err := s.store.Update(func(c *bootstrap.Config) {
+		c.WatchFolders = enabled
+		for i := range c.Folders {
+			c.Folders[i].Watching = enabled
+		}
+	}); err != nil {
+		return err
+	}
+	s.refreshWatcher()
+	return nil
+}
+
+// RevealInExplorer 在系统文件管理器中定位路径
+func (s *LibraryService) RevealInExplorer(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("路径为空")
+	}
+	target := path
+	if st, err := os.Stat(target); err != nil || !st.IsDir() {
+		target = filepath.Dir(path)
+	}
+	return revealPath(target)
+}
+
+// PickDirectory 单独暴露目录选择（设置界面「添加文件夹」用）
+func (s *LibraryService) PickDirectory() (string, error) {
+	return s.pickDirectory()
+}
+
+// Stats 曲库统计（关于页面用）
+func (s *LibraryService) Stats() map[string]any {
+	songs := s.lib.Songs()
+	var totalMS int64
+	var totalBytes int64
+	for _, s := range songs {
+		totalMS += s.Duration
+		totalBytes += s.Size
+	}
+	return map[string]any{
+		"count":      len(songs),
+		"durationMs": totalMS,
+		"bytes":      totalBytes,
+		// 与 Folders() 口径一致：只数用户配置的文件夹（隐式下载根不算），
+		// 否则「关于」页的数字会比设置界面里列出来的多一个。
+		"folders":  len(s.Folders()),
+		"scanning": s.lib.IsScanning(),
+	}
+}
+
+// RefreshWatchers 供「设置」修改后手动刷新监听
+func (s *LibraryService) RefreshWatchers() {
+	s.refreshWatcher()
+}
+
+func (s *LibraryService) refreshWatcher() {
+	if s.watch == nil {
+		return
+	}
+	cfg := s.store.Get()
+	roots := make([]string, 0, len(cfg.Folders)+1)
+	if cfg.WatchFolders {
+		// 用 EffectiveFolders 而不是 cfg.Folders：下载目录是一个**隐式扫描根**
+		// （见 bootstrap.EffectiveFolders），而 Scan 就是这么取的。两边口径不一致
+		// 会导致「下载目录里的新歌不会自动出现」。
+		for _, f := range cfg.EffectiveFolders() {
+			roots = append(roots, f.Path)
+		}
+	}
+	// EnsureStarted 而不是 SetRoots：启动时若没有文件夹 / 监听是关的，
+	// 事件循环从未启动，只 SetRoots 会得到「界面说在监听、实际收不到事件」。
+	s.watch.EnsureStarted(roots)
+}
+
+func (s *LibraryService) pickDirectory() (string, error) {
+	if s.app == nil {
+		return "", errors.New("当前环境不支持系统目录选择器")
+	}
+	selected, err := s.app.Dialog.OpenFile().
+		SetTitle("选择音乐文件夹").
+		CanChooseDirectories(true).
+		CanChooseFiles(false).
+		CanCreateDirectories(true).
+		PromptForSingleSelection()
+	if err != nil {
+		if isDialogCancelled(err) {
+			// 用户点了取消 / 关闭：这是正常结果，不是错误。
+			return "", nil
+		}
+		return "", fmt.Errorf("打开目录选择器失败: %w", err)
+	}
+	return selected, nil
+}
+
+// isDialogCancelled 判断系统对话框返回的错误到底是「用户取消」还是真的失败。
+//
+// ★ 为什么必须分开：Wails v3 的 Windows 实现（内部走 go-common-file-dialog）
+// 把「用户点了取消 / 关了窗口」**也**变成一个 error 抛上来，文本是
+// `cancelled by user`（见 wails internal/go-common-file-dialog/cfd 的
+// ErrorCancelled）。不区分的话，「取消」会被上层当成「选择器打不开」——
+// 前端以前据此弹出「请手动输入路径」的回退框：用户明明只是点了取消，
+// 却被追着要一个路径。桌面版里 Go 后端总在，这个回退纯属误伤。
+//
+// 为什么不直接 errors.Is(err, cfd.ErrorCancelled)：那个包在 wails 模块的
+// internal 下，按 Go 规则不可导入，只能按错误文本判定。文本匹配失败的最坏
+// 后果是退回「当成失败」，不会再出现误报成功。
+func isDialogCancelled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	// 两种拼写都认（上游不同版本 / 不同平台用过 canceled 与 cancelled）
+	return strings.Contains(msg, "cancelled by user") || strings.Contains(msg, "canceled by user")
+}
+
+func (s *LibraryService) emit(name string, payload any) {
+	if s.app == nil {
+		return
+	}
+	s.app.Event.Emit(name, payload)
+}
+
+// ---------------------------------------------------------------------------
+// Playlist 服务：歌单、我喜欢、队列顺序持久化
+// ---------------------------------------------------------------------------
+
+// PlaylistService 歌单接口
+type PlaylistService struct {
+	store *bootstrap.Store
+}
+
+// NewPlaylistService 构造服务
+func NewPlaylistService(store *bootstrap.Store) *PlaylistService {
+	return &PlaylistService{store: store}
+}
+
+const likedPlaylistID = "liked"
+
+// List 返回全部歌单（第一个固定是「我喜欢」）
+func (s *PlaylistService) List() []bootstrap.Playlist {
+	cfg := s.store.Get()
+
+	// 绑定返回的列表字段永远不能是 nil（第 19 条约定）：没有一首「我喜欢」时
+	// append([]string(nil), ...) 会得到 nil，序列化出来是 "songIds":null，
+	// 而前端对这类列表是「Array.isArray 才更新状态」—— null 会被当成
+	// 「这次没拿到数据」，于是取消收藏最后一首后界面上那首歌还在。
+	likedIDs := make([]string, 0, len(cfg.LikedIDs))
+	likedIDs = append(likedIDs, cfg.LikedIDs...)
+	liked := bootstrap.Playlist{
+		ID:        likedPlaylistID,
+		Name:      "我喜欢",
+		Locked:    true,
+		Builtin:   true,
+		SongIDs:   likedIDs,
+		CreatedAt: 0,
+	}
+	out := make([]bootstrap.Playlist, 0, len(cfg.Playlists)+1)
+	out = append(out, liked)
+	for _, p := range cfg.Playlists {
+		if p.ID == likedPlaylistID {
+			continue
+		}
+		// 同上：老配置或手工编辑过的 config.json 里可能存着 null，
+		// 直接透传会让自定义歌单也返回 songIds:null。
+		if p.SongIDs == nil {
+			p.SongIDs = []string{}
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// Create 新建歌单
+func (s *PlaylistService) Create(name string) (bootstrap.Playlist, error) {
+	clean := strings.TrimSpace(name)
+	if clean == "" {
+		return bootstrap.Playlist{}, errors.New("歌单名称不能为空")
+	}
+	cfg := s.store.Get()
+	for _, p := range cfg.Playlists {
+		if strings.EqualFold(p.Name, clean) {
+			return bootstrap.Playlist{}, fmt.Errorf("已存在同名歌单：%s", clean)
+		}
+	}
+	pl := bootstrap.Playlist{
+		ID:        bootstrap.RandomID("pl"),
+		Name:      clean,
+		Locked:    false,
+		Builtin:   false,
+		SongIDs:   []string{},
+		CreatedAt: time.Now().UnixMilli(),
+	}
+	if err := s.store.Update(func(c *bootstrap.Config) {
+		c.Playlists = append(c.Playlists, pl)
+	}); err != nil {
+		return bootstrap.Playlist{}, err
+	}
+	return pl, nil
+}
+
+// Rename 重命名歌单
+func (s *PlaylistService) Rename(id, name string) error {
+	if id == likedPlaylistID {
+		return errors.New("「我喜欢」是默认歌单，不可重命名")
+	}
+	clean := strings.TrimSpace(name)
+	if clean == "" {
+		return errors.New("歌单名称不能为空")
+	}
+	found := false
+	err := s.store.Update(func(c *bootstrap.Config) {
+		for i := range c.Playlists {
+			if c.Playlists[i].ID == id {
+				c.Playlists[i].Name = clean
+				found = true
+			}
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("歌单不存在: %s", id)
+	}
+	return nil
+}
+
+// Delete 删除歌单（不动本地文件）；「我喜欢」不可删除
+func (s *PlaylistService) Delete(id string) error {
+	if id == likedPlaylistID {
+		return errors.New("「我喜欢」是默认歌单，不可删除")
+	}
+	removed := false
+	err := s.store.Update(func(c *bootstrap.Config) {
+		next := make([]bootstrap.Playlist, 0, len(c.Playlists))
+		for _, p := range c.Playlists {
+			if p.ID == id {
+				removed = true
+				continue
+			}
+			next = append(next, p)
+		}
+		c.Playlists = next
+	})
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("歌单不存在: %s", id)
+	}
+	return nil
+}
+
+// AddSongs 批量加入歌单（去重）
+//
+// 歌单 id 不存在时必须**报错**，不能返回 (0, nil)：调用方（前端）拿到
+// added=0 会理解成「这些歌本来就在里面」，而真实原因是「后端根本没有这个歌单」，
+// 于是内存里的歌单看着加进去了、config.json 里一首都没有。
+func (s *PlaylistService) AddSongs(id string, songIDs []string) (int, error) {
+	added := 0
+	found := id == likedPlaylistID
+	err := s.store.Update(func(c *bootstrap.Config) {
+		if id == likedPlaylistID {
+			before := len(c.LikedIDs)
+			c.LikedIDs = appendUnique(c.LikedIDs, songIDs...)
+			added = len(c.LikedIDs) - before
+			return
+		}
+		for i := range c.Playlists {
+			if c.Playlists[i].ID != id {
+				continue
+			}
+			found = true
+			before := len(c.Playlists[i].SongIDs)
+			c.Playlists[i].SongIDs = appendUnique(c.Playlists[i].SongIDs, songIDs...)
+			added = len(c.Playlists[i].SongIDs) - before
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("歌单不存在: %s", id)
+	}
+	return added, nil
+}
+
+// RemoveSongs 从歌单移除（「我喜欢」请用 Library.ToggleLike）
+func (s *PlaylistService) RemoveSongs(id string, songIDs []string) (int, error) {
+	if id == likedPlaylistID {
+		return 0, errors.New("请用爱心按钮取消喜欢")
+	}
+	removed := 0
+	found := false
+	drop := map[string]bool{}
+	for _, sid := range songIDs {
+		drop[sid] = true
+	}
+	err := s.store.Update(func(c *bootstrap.Config) {
+		for i := range c.Playlists {
+			if c.Playlists[i].ID != id {
+				continue
+			}
+			found = true
+			before := len(c.Playlists[i].SongIDs)
+			next := make([]string, 0, before)
+			for _, sid := range c.Playlists[i].SongIDs {
+				if drop[sid] {
+					continue
+				}
+				next = append(next, sid)
+			}
+			c.Playlists[i].SongIDs = next
+			removed = before - len(next)
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		// 与 AddSongs 同理：id 不存在时不能返回 (0, nil)，否则前端会把它
+		// 当成「本来就没有这些歌」。
+		return 0, fmt.Errorf("歌单不存在: %s", id)
+	}
+	return removed, nil
+}
+
+// Reorder 调整歌单内歌曲顺序（前端拖拽排序后调用，用于持久化）
+//
+// 「我喜欢」的歌曲顺序存在 config.LikedIDs 而不是 Playlists 里，
+// 这里必须单独处理：否则拖拽「我喜欢」的队列时后端静默什么都不做
+// （队列里有歌单里没有的歌时，前端还会把这次拖拽写回歌单 —— 见 store#reorderQueue）。
+func (s *PlaylistService) Reorder(id string, from, to int) error {
+	found := id == likedPlaylistID
+	err := s.store.Update(func(c *bootstrap.Config) {
+		if id == likedPlaylistID {
+			c.LikedIDs = moveIndex(c.LikedIDs, from, to)
+			return
+		}
+		for i := range c.Playlists {
+			if c.Playlists[i].ID != id {
+				continue
+			}
+			found = true
+			c.Playlists[i].SongIDs = moveIndex(c.Playlists[i].SongIDs, from, to)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("歌单不存在: %s", id)
+	}
+	return nil
+}
+
+// ReorderPlaylists 调整侧边栏歌单顺序（from/to 为「不含我喜欢」的下标）
+func (s *PlaylistService) ReorderPlaylists(from, to int) error {
+	return s.store.Update(func(c *bootstrap.Config) {
+		c.Playlists = moveIndex(c.Playlists, from, to)
+	})
+}
+
+// Export 导出 m3u 到歌单所在目录（返回写入的文件路径）
+func (s *PlaylistService) Export(id string) (string, error) {
+	cfg := s.store.Get()
+
+	var name string
+	var ids []string
+	if id == likedPlaylistID {
+		name = "我喜欢"
+		ids = cfg.LikedIDs
+	} else {
+		for _, p := range cfg.Playlists {
+			if p.ID == id {
+				name = p.Name
+				ids = p.SongIDs
+			}
+		}
+	}
+	if name == "" {
+		return "", fmt.Errorf("歌单不存在: %s", id)
+	}
+
+	// 通过 library 查路径：这里注入一个只读回调更省事，因此直接读配置里的歌曲缓存文件
+	songs := readSongCache(s.store.DataDir())
+
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	for _, sid := range ids {
+		if path, ok := songs[sid]; ok {
+			fmt.Fprintf(&b, "#EXTINF:-1,%s\n%s\n", filepath.Base(path), path)
+		}
+	}
+
+	out := filepath.Join(s.store.DataDir(), sanitizeFileName(name)+".m3u")
+	if err := os.WriteFile(out, []byte(b.String()), 0o644); err != nil {
+		return "", fmt.Errorf("写入 m3u 失败: %w", err)
+	}
+	return out, nil
+}
+
+/* --------------------------------------------------------------------------
+   Lyrics 服务
+   --------------------------------------------------------------------------
+   读取链（与设置里的「歌词来源优先级」一致）：
+     内嵌歌词 → 同目录同名 .lrc → 歌词缓存 → 在线自动匹配
+
+   写回的两种情形：
+     · 用户手动匹配（前端搜索候选 → 应用）→ Save()
+     · 播放时自动匹配成功 → AutoMatch() 内部顺手写缓存
+   两者都会按设置里的「把封面/歌词写进歌曲文件」决定是否同时嵌入音频文件。
+   没有缓存这一层是实测的 bug：手动匹配的歌词只存在前端内存里，
+   关掉应用再打开就没了。
+   -------------------------------------------------------------------------- */
+
+// LyricsService 歌词接口
+type LyricsService struct {
+	store *bootstrap.Store
+	songs func(id string) (bootstrap.Song, bool)
+	// cache 歌词缓存（可空：为空时跳过缓存层）
+	cache *metacache.Store
+	// online 在线歌词聚合器（可空：为空时不做在线自动匹配）
+	online LyricsMatcher
+	// ai 元数据清洗（可选）
+	ai *AiService
+
+	// wordTried 「已经为逐字歌词联网试过的歌」→ 试过的时间。
+	//
+	// 为什么要有：UpgradeWordLyrics 跑在**切歌**路径上。不做记录的话，
+	// 每切到一首只有行级歌词的歌都会联网搜一次（多数结果是没有逐字），
+	// 既慢又白耗第三方接口的配额。一次运行里每首歌只试一次。
+	wordMu    sync.Mutex
+	wordTried map[string]time.Time
+}
+
+// wordUpgradeTTL 同一首歌「再试一次逐字」的最小间隔。
+const wordUpgradeTTL = 6 * time.Hour
+
+// LyricsMatcher 在线歌词匹配的最小接口。
+//
+// 用接口而不是直接依赖 lyricsfetch.Aggregator：测试里可以塞一个假的，
+// 而且「在线歌词」这件事将来换实现（换源、加缓存）不会牵动本服务。
+type LyricsMatcher interface {
+	Match(ctx context.Context, title, artist string, durationMS int64) (lrc, provider, matchedTitle, matchedArtist string, err error)
+}
+
+// NewLyricsService 构造服务
+func NewLyricsService(store *bootstrap.Store, songs func(id string) (bootstrap.Song, bool)) *LyricsService {
+	return &LyricsService{store: store, songs: songs}
+}
+
+// setCache 注入歌词缓存（main 里装配）。
+func (s *LyricsService) setCache(cache *metacache.Store) { s.cache = cache }
+
+// setOnline 注入在线歌词匹配器（main 里装配）。
+func (s *LyricsService) setOnline(m LyricsMatcher) { s.online = m }
+
+// setAI 注入元数据清洗服务（可选）。
+func (s *LyricsService) setAI(ai *AiService) { s.ai = ai }
+
+// cachedLyrics 返回「按 id 读缓存」的闭包，供 internal/lyrics 使用。
+func (s *LyricsService) cachedLyrics(songID string) lyrics.Cache {
+	if s.cache == nil {
+		return nil
+	}
+	return func(id string) (string, bool) { return s.cache.Lyrics(id) }
+}
+
+// Load 按设置里的优先级加载歌词（**只读本地**，不联网）。
+//
+// 之所以不在这里联网：本方法在「每次切歌」时都会被调用，联网等待会把
+// 播放界面卡住十几秒。在线自动匹配走 AutoMatch，由前端在本地读不到时再触发。
+//
+// 在线试听曲目（不在本地曲库里）也走这里：它们没有本地文件，但可能有缓存
+// （用户手动匹配过），所以查不到歌曲时不去报错，而是继续读缓存。
+func (s *LyricsService) Load(songID string) (lyrics.Result, error) {
+	song, ok := s.songs(songID)
+	if !ok {
+		// 不是本地歌曲：只可能命中缓存
+		if text, hit := s.cacheGet(songID); hit {
+			return lyrics.Result{LRC: text, Source: lyrics.SourceCache}, nil
+		}
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+	return lyrics.Load(songID, song.Path, s.store.Get().LyricsSources, s.cachedLyrics(songID)), nil
+}
+
+// AutoMatch 本地读不到歌词时，联网自动匹配一次，并把结果写进缓存。
+//
+// 返回的 Result.Source 形如 online:lrclib；没匹配到返回 source=none 而不是错误
+// （「这首歌没有歌词」是正常结果，不该让前端弹错误）。
+func (s *LyricsService) AutoMatch(songID string) (lyrics.Result, error) {
+	song, ok := s.songs(songID)
+	if !ok {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+	if !lyrics.WantOnline(s.store.Get().LyricsSources) {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+	if s.online == nil {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+
+	title, artist := s.cleanMetaFor(song)
+	if strings.TrimSpace(title) == "" {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+	// 文件名当标题的「无标签文件」（Track 07 / 01 / unknown…）匹配在线歌词
+	// 只会撞上别人的歌词 —— 错的歌词比没有歌词更糟，直接不搜。
+	if isPlaceholderTitle(title) && strings.TrimSpace(artist) == "" {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	lrc, provider, matchedTitle, matchedArtist, err := s.online.Match(ctx, title, artist, song.Duration)
+	if err != nil || strings.TrimSpace(lrc) == "" {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+
+	// 有的来源会给「字级」歌词（逐字时间戳 / QRC / KRC / klyric / YRC）。
+	// 这里归一化成**增强 LRC**：逐字时间轴原样保留（前端按字点亮），
+	// 只有「写进歌曲文件」那一步才再剥成行级（见 Save）。
+	lrc = lyrics.NormalizeWordLevel(lrc)
+	if strings.TrimSpace(lrc) == "" {
+		return lyrics.Result{LRC: "", Source: lyrics.SourceNone}, nil
+	}
+
+	// 匹配到就落缓存：下一次打开（甚至离线）也还在，这是「第二次打开又没有了」的修法。
+	// 写缓存失败不影响本次显示，所以忽略错误只记日志。
+	s.saveToCache(songID, lrc, "online:"+provider)
+
+	src := lyrics.SourceOnline
+	if provider != "" {
+		src = "online:" + provider
+	}
+	return lyrics.Result{LRC: lrc, Source: src, Title: matchedTitle, Artist: matchedArtist}, nil
+}
+
+// UpgradeWordLyrics 给「本地/缓存里只有行级」的歌在线找一份**字级（逐字）**歌词。
+//
+// 存在的理由（需求：有逐字就播逐字，没有才播逐行）：本地那三级——内嵌歌词、
+// 同名 .lrc、歌词缓存——给的绝大多数是行级，尤其是**老版本缓存下来的**那些
+// （当年拿到逐字也会被剥成行级）。没有这一步，用户永远看不到逐字歌词，
+// 哪怕在线来源手里就有。
+//
+// 只在**真的拿到字级**时才写缓存：internal/lyrics#Load 的选词规则是
+// 「字级结果优先于行级结果」，所以写进缓存之后每次打开都会优先用它，
+// 不需要另存一份「升级结果」，也不会跟用户设置的来源顺序打架。
+//
+// 拿不到逐字时返回 lrc 为空（不是错误）：「这首歌没有逐字版本」是正常结果，
+// 调用方保持原来的行级显示即可。
+//
+// 同一首歌在一次运行里只试一次（见 wordTried）。前端在后台调用，不挡播放。
+func (s *LyricsService) UpgradeWordLyrics(songID string) (map[string]any, error) {
+	none := map[string]any{"lrc": "", "wordLevel": false}
+	song, ok := s.songs(songID)
+	if !ok || s.online == nil {
+		return none, nil
+	}
+	if !lyrics.WantOnline(s.store.Get().LyricsSources) {
+		// 用户把 online 从来源里去掉 = 「只要本地歌词」，升级必须尊重这个意图
+		return none, nil
+	}
+	if !s.markWordTried(songID) {
+		return none, nil
+	}
+
+	title, artist := s.cleanMetaFor(song)
+	if strings.TrimSpace(title) == "" {
+		return none, nil
+	}
+	// 与 AutoMatch 同一条理由：文件名兜底的标题匹配在线歌词只会撞上别人的歌词。
+	if isPlaceholderTitle(title) && strings.TrimSpace(artist) == "" {
+		return none, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	// Match 自己就带字级优先（见 lyricsfetch#Match）：最匹配的候选若只有行级，
+	// 它会为声明了字级能力的来源多试一次。
+	lrc, provider, matchedTitle, matchedArtist, err := s.online.Match(ctx, title, artist, song.Duration)
+	if err != nil || strings.TrimSpace(lrc) == "" {
+		return none, nil
+	}
+	lrc = lyrics.NormalizeWordLevel(lrc)
+	if !lyrics.HasWordTiming(lrc) {
+		return none, nil
+	}
+
+	s.saveToCache(songID, lrc, "online:"+provider)
+	src := lyrics.SourceOnline
+	if provider != "" {
+		src = "online:" + provider
+	}
+	return map[string]any{
+		"lrc":       lrc,
+		"source":    src,
+		"provider":  provider,
+		"title":     matchedTitle,
+		"artist":    matchedArtist,
+		"wordLevel": true,
+	}, nil
+}
+
+// markWordTried 记录「这首歌为逐字试过了」；距上次不足 wordUpgradeTTL 时返回 false。
+func (s *LyricsService) markWordTried(songID string) bool {
+	s.wordMu.Lock()
+	defer s.wordMu.Unlock()
+	if s.wordTried == nil {
+		s.wordTried = map[string]time.Time{}
+	}
+	if at, ok := s.wordTried[songID]; ok && time.Since(at) < wordUpgradeTTL {
+		return false
+	}
+	// 上限保护：长时间挂着播放会累积到几千条，超限就整体清掉重来
+	// （清掉最坏只是某首歌多试一次，不会出错）。
+	if len(s.wordTried) >= 2048 {
+		s.wordTried = map[string]time.Time{}
+	}
+	s.wordTried[songID] = time.Now()
+	return true
+}
+
+// Save 保存用户手动匹配到的歌词：写缓存，并按设置决定是否嵌入音频文件。
+//
+// embed 是显式传入的（nil = 按配置走）：前端配置是防抖同步的，
+// 「刚开开关就应用歌词」时后端读到的可能还是旧值。
+func (s *LyricsService) Save(songID, lrc, source string, embed *bool) (map[string]any, error) {
+	raw := strings.TrimSpace(lrc)
+	if raw == "" {
+		return nil, errors.New("歌词内容为空")
+	}
+	if strings.TrimSpace(source) == "" {
+		source = "user"
+	}
+	if s.cache == nil {
+		return nil, errors.New("歌词缓存不可用")
+	}
+
+	// 用户点「应用」时把歌词归一化成**增强 LRC**：字级（逐字 / QRC / KRC）
+	// 时间轴要保留下来 —— 界面按字点亮、微调面板的平移都靠它。
+	// 写进歌曲文件的那份另外剥成行级（见下面 embedLrc）。
+	wasWordLevel := lyrics.HasWordTiming(raw)
+	lrc = lyrics.NormalizeWordLevel(raw)
+	if strings.TrimSpace(lrc) == "" {
+		return nil, errors.New("歌词内容为空")
+	}
+	keptWordLevel := lyrics.HasWordTiming(lrc)
+
+	if _, err := s.cache.SaveLyrics(songID, lrc, source); err != nil {
+		return nil, err
+	}
+
+	out := map[string]any{
+		"ok":        true,
+		"cached":    true,
+		"source":    source,
+		"embedded":  false,
+		"lrc":       lrc,
+		"wordLevel": keptWordLevel,
+		"lineLevel": !keptWordLevel,
+		// 「输入是字级、归一化后没了」只可能发生在识别不出的写法上
+		"converted": wasWordLevel && !keptWordLevel,
+	}
+	song, ok := s.songs(songID)
+	if !ok {
+		// 在线试听曲目：没有本地文件可写，缓存就是全部
+		out["note"] = "歌词已应用并保存到歌词缓存（在线曲目没有本地文件，不写进歌曲文件）"
+		return out, nil
+	}
+
+	embedEnabled := s.store.Get().EmbedMeta
+	if embed != nil {
+		embedEnabled = *embed
+	}
+	if !embedEnabled {
+		out["note"] = "歌词已应用并保存到歌词缓存（设置里没有开启「写入歌曲文件」）"
+		return out, nil
+	}
+	if !metacache.SupportedEmbed(song.Ext) {
+		out["note"] = "歌词已应用并保存到歌词缓存；该格式暂不支持写入歌曲文件"
+		return out, nil
+	}
+	// 写进歌曲文件的必须是行级：逐字标记（<00:12.00> / (0,300)）进了标签，
+	// 别的播放器会把它们当成歌词正文显示出来。缓存里存的仍是字级那一份。
+	embedLrc := lyrics.NormalizeLineLevel(lrc)
+	res, err := metacache.EmbedLyrics(song.Path, embedLrc)
+	switch {
+	case err == nil && res.OK:
+		out["embedded"] = true
+		out["note"] = "已写入歌曲文件：" + res.Message
+	case errors.Is(err, metacache.ErrUnsupported):
+		out["note"] = "歌词已应用并保存到歌词缓存；该格式暂不支持写入歌曲文件"
+	default:
+		// ★ 措辞要点：这次「应用」是**成功**的 —— 歌词已经进了缓存，播放时用的就是它，
+		//   没做成的只是「额外写一份进歌曲文件」。早先写成「写入文件失败：…」，
+		//   用户看到就以为歌词根本没保存上（实测反馈）。所以先说已应用，
+		//   再说没写进文件，原因紧跟在后面。
+		out["note"] = "歌词已应用并保存到歌词缓存；没有写入歌曲文件 —— " + errText(err)
+	}
+	return out, nil
+}
+
+// LoadCached 只读缓存（前端在「本地 + 在线」都拿不到时确认一次）。
+func (s *LyricsService) LoadCached(songID string) map[string]any {
+	if text, ok := s.cacheGet(songID); ok {
+		// 老缓存里可能是当年被剥成行级的文本，新读出来统一过一遍归一化
+		return map[string]any{"lrc": lyrics.NormalizeWordLevel(text), "source": lyrics.SourceCache, "cached": true}
+	}
+	return map[string]any{"lrc": "", "source": lyrics.SourceNone, "cached": false}
+}
+
+func (s *LyricsService) saveToCache(songID, text, source string) {
+	if s.cache == nil {
+		return
+	}
+	if _, err := s.cache.SaveLyrics(songID, text, source); err != nil {
+		log.Printf("[lyrics] 写入缓存失败 %s: %v", songID, err)
+	}
+}
+
+func (s *LyricsService) cacheGet(songID string) (string, bool) {
+	if s.cache == nil {
+		return "", false
+	}
+	return s.cache.Lyrics(songID)
+}
+
+// cleanMetaFor 准备「拿去联网匹配」的标题与歌手。
+//
+// 顺序：本地整形（不联网、不等 AI）→ 仍然脏才花一次 AI 请求 → 再整形一次。
+//
+// 为什么本地整形必须在最前面：文件名兜底的标题里混着歌词与编号
+// （例：《此去半生》-吴昊 “花开又花谢花漫天…”），这种标题发出去
+// 既搜不到东西、又会让打分把所有候选打成 0 分，最后被判成「没有歌词」。
+// 本地整形能把这类标题还原成「此去半生 / 吴昊」，且完全不需要等网络。
+// aiEnabled 判断「自动匹配歌词时用 AI 清洗元数据」是否开启。
+//
+// 开关（config.aiLyricsClean）是用户可见的行为：关掉后歌词匹配只走
+// 本地整形（sanitizeLyricsMeta），不再等待 8~18 秒的 AI 请求。
+func (s *LyricsService) aiEnabled() bool {
+	if s.ai == nil || !s.ai.Enabled() {
+		return false
+	}
+	if s.store != nil && !s.store.Get().AILyricsClean {
+		return false
+	}
+	return true
+}
+
+func (s *LyricsService) cleanMetaFor(song bootstrap.Song) (string, string) {
+	title, artist := sanitizeLyricsMeta(song.Title, song.Artist)
+	if s.aiEnabled() && needsCleanMeta(title, artist) {
+		if cleaned, err := s.ai.ExtractMeta(title, artist, song.Album, filepath.Base(song.Path)); err == nil {
+			title, artist, _ = mergeCleanMeta(title, artist, "", cleaned)
+		}
+	}
+	title, artist = sanitizeLyricsMeta(title, artist)
+	return title, artist
+}
+
+// errText 取错误的正文用于**给用户看的提示**，顺带去掉尾部的句号/逗号，
+// 好让调用方用「：原因」「—— 原因」这类前缀接上去时不会出现「。，」这种叠标点。
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(err.Error()), "。，,.")
+}
+
+// ---------------------------------------------------------------------------
+// Themes 服务
+// ---------------------------------------------------------------------------
+
+// ThemeService 主题接口
+type ThemeService struct {
+	mgr *theme.Manager
+	// app 用于「导入主题」时弹系统目录选择器（main 里装配，测试时可空）。
+	app *application.App
+}
+
+// NewThemeService 构造服务
+func NewThemeService(mgr *theme.Manager) *ThemeService {
+	return &ThemeService{mgr: mgr}
+}
+
+// List 主题列表
+func (s *ThemeService) List() []theme.Info {
+	return s.mgr.List()
+}
+
+// Load 主题 CSS 原文
+func (s *ThemeService) Load(id string) (string, error) {
+	return s.mgr.CSS(id)
+}
+
+// Reload 重新扫描主题目录（用户在外部新增文件后调用）
+func (s *ThemeService) Reload() ([]theme.Info, error) {
+	if err := s.mgr.Reload(); err != nil {
+		return nil, err
+	}
+	return s.mgr.List(), nil
+}
+
+// Dir 主题目录路径
+func (s *ThemeService) Dir() string { return s.mgr.Dir() }
+
+// RevealDir 在资源管理器中打开主题目录
+func (s *ThemeService) RevealDir() error { return revealPath(s.mgr.Dir()) }
+
+// Delete 删除一个主题（只删主题目录里的那个 CSS 文件，不碰其它任何东西）。
+//
+// 内置主题不能删（每次启动都会重新生成），由 internal/theme 给出可读原因。
+// 删完 manager 会自己重扫，前端拿到的是磁盘的最新状态。
+func (s *ThemeService) Delete(id string) error {
+	if s == nil || s.mgr == nil {
+		return errors.New("主题服务未就绪")
+	}
+	return s.mgr.Delete(id)
+}
+
+// Import 弹出系统目录选择器，把选中的文件夹里的主题 CSS 导入主题目录。
+//
+// 返回 { cancelled, imported: []string, skipped: []string }：
+// 用户取消时只有 cancelled=true；校验不通过时返回错误（前端弹错误提示），
+// 部分文件不合格时 imported/skipped 会同时有值，让前端能如实汇报。
+func (s *ThemeService) Import() (map[string]any, error) {
+	if s == nil || s.mgr == nil {
+		return nil, errors.New("主题服务未就绪")
+	}
+	if s.app == nil {
+		return nil, errors.New("当前环境不支持系统目录选择器")
+	}
+	selected, err := s.app.Dialog.OpenFile().
+		SetTitle("选择要导入的主题文件夹").
+		CanChooseDirectories(true).
+		CanChooseFiles(false).
+		CanCreateDirectories(false).
+		PromptForSingleSelection()
+	if err != nil {
+		return nil, fmt.Errorf("打开目录选择器失败: %w", err)
+	}
+	if strings.TrimSpace(selected) == "" {
+		return map[string]any{"cancelled": true}, nil
+	}
+	res, err := s.mgr.ImportDir(selected)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"cancelled": false,
+		"imported":  res.Imported,
+		"skipped":   res.Skipped,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Config 服务
+// ---------------------------------------------------------------------------
+
+// ConfigService 配置接口
+type ConfigService struct {
+	store *bootstrap.Store
+}
+
+// NewConfigService 构造服务
+func NewConfigService(store *bootstrap.Store) *ConfigService {
+	return &ConfigService{store: store}
+}
+
+// Get 读取当前配置。
+//
+// ★ 返回前会把 AIAPIKey 打码：这个结构体会被序列化后交给前端，
+// 而前端的运行环境里可以加载**用户数据目录中的任意第三方皮肤 JS**
+// （见 packages/player-skins 的动态 import），密钥一旦进入前端就等于
+// 「任何能跑代码的界面组件都能读到它」。
+//
+// 前端真正需要的只是「配没配」（见 settings-view.js 的 configured 判断），
+// 所以这里把密钥替换成固定占位串，另给一个 aiApiKeySet 布尔位。
+// 写回路径不受影响：Set 收到占位串时会忽略（见 applyPatch），
+// 用户不改密钥时原值保留。
+func (s *ConfigService) Get() bootstrap.Config {
+	cfg := s.store.Get()
+	// 先算出「有没有配密钥」，再打码 —— 顺序反了会让布尔位永远为 false。
+	cfg.AIAPIKeySet = strings.TrimSpace(cfg.AIAPIKey) != ""
+	cfg.AIAPIKey = maskSecret(cfg.AIAPIKey)
+	// 接口地址不合法时把原因一并交给前端（设置页会显示出来）。
+	//
+	// 规则由后端算（internal/bootstrap.NormalizeAIBaseURL），前端只负责显示：
+	// 再在前端写一遍校验必然会漂移，而漂移的代价是「界面说没问题、后端却
+	// 拒绝发请求」—— 那正是「AI 莫名不工作」最难查的一类。
+	// 出错信息本身不回显地址与密钥（见该函数的文档注释）。
+	if _, err := bootstrap.NormalizeAIBaseURL(cfg.AIBaseURL); err != nil {
+		cfg.AIBaseURLProblem = errText(err)
+	}
+	return cfg
+}
+
+// secretPlaceholder 是回传给前端的密钥占位串。前端不会把它写回
+// （applyPatch 会识别并忽略），因此它只是一个「这里本来有值」的标记。
+const secretPlaceholder = "\x00SET\x00"
+
+// maskSecret 把非空密钥替换成占位串；空值保持空。
+func maskSecret(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return ""
+	}
+	return secretPlaceholder
+}
+
+// isMaskedSecret 判断前端回传的值是不是占位串（是则应当忽略、保留原值）。
+func isMaskedSecret(v string) bool { return v == secretPlaceholder }
+
+// Set 增量写入配置（只覆盖传入的键）
+func (s *ConfigService) Set(patch map[string]any) (bootstrap.Config, error) {
+	err := s.store.Update(func(c *bootstrap.Config) {
+		applyPatch(c, patch)
+	})
+	if err != nil {
+		return bootstrap.Config{}, err
+	}
+	return s.Get(), nil
+}
+
+// Path 配置文件路径
+func (s *ConfigService) Path() string { return s.store.Path() }
+
+// Reset 恢复默认配置（保留文件夹列表）
+//
+// ★ 数据目录与**配置文件路径必须从当前配置上取**，绝不能照抄 DefaultConfig() 的
+// 那一份：默认值里的 ConfigPath 是空的（它由 NewStore 在运行时按 DataDir 拼出来），
+// 照抄等于把「往哪儿落盘」一起清掉 —— 之后所有设置改动都只改内存、重启即丢，
+// 而报错是 `rename .3.tmp : The system cannot find the path specified`，
+// 完全看不出根因（历史故障，见审查报告第 9 条）。
+func (s *ConfigService) Reset() (bootstrap.Config, error) {
+	def := bootstrap.DefaultConfig()
+	err := s.store.Update(func(c *bootstrap.Config) {
+		// 先把运行时事实抓在手里，再整体覆盖成默认值。
+		folders := c.Folders
+		dataDir := c.DataDir
+		configPath := c.ConfigPath
+		*c = *def
+		c.Folders = folders
+		c.DataDir = dataDir
+		c.ConfigPath = configPath
+	})
+	if err != nil {
+		return bootstrap.Config{}, err
+	}
+	return s.store.Get(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Media 服务
+// ---------------------------------------------------------------------------
+
+// MediaService 音频播放地址
+type MediaService struct {
+	srv   *media.Server
+	songs func(id string) (bootstrap.Song, bool)
+}
+
+// NewMediaService 构造服务
+func NewMediaService(srv *media.Server, songs func(id string) (bootstrap.Song, bool)) *MediaService {
+	return &MediaService{srv: srv, songs: songs}
+}
+
+// URL 返回某首歌的播放地址。
+//
+// 返回的是**页面同源**的相对路径（/audio/xxx?t=...），由 Wails 的 asset server
+// 提供。原因：WebView2 会拒绝从 http://wails.localhost 页面加载
+// http://127.0.0.1:port 的媒体（"Media load rejected by URL safety check"），
+// 跨源音频在这个环境下根本发不出请求。
+func (s *MediaService) URL(songID string) (string, error) {
+	song, ok := s.songs(songID)
+	if !ok {
+		return "", fmt.Errorf("歌曲不存在: %s", songID)
+	}
+	if !bootstrap.NeedsTranscode(song.Ext) || s.srv.CanTranscode() {
+		return s.srv.SameOriginURL(songID), nil
+	}
+	return "", fmt.Errorf("格式 .%s 需要 ffmpeg 转码，请先安装 ffmpeg", song.Ext)
+}
+
+// State 返回播放服务状态（前端据此提示「需安装 ffmpeg」）
+func (s *MediaService) State() map[string]any {
+	return map[string]any{
+		"baseUrl":      "",
+		"sameOrigin":   true,
+		"canTranscode": s.srv.CanTranscode(),
+		"tools":        s.srv.ToolsInfo(),
+	}
+}
+
+// ClearTranscodeCache 清空转码缓存（不能原生播放的格式转出的 WAV）
+func (s *MediaService) ClearTranscodeCache() (map[string]any, error) {
+	if err := s.srv.ClearCache(); err != nil {
+		return nil, err
+	}
+	count, bytes := s.srv.CacheStats()
+	return map[string]any{"count": count, "bytes": bytes}, nil
+}
+
+// CacheStats 转码缓存占用
+func (s *MediaService) CacheStats() map[string]any {
+	count, bytes := s.srv.CacheStats()
+	return map[string]any{"count": count, "bytes": bytes}
+}
+
+// ---------------------------------------------------------------------------
+// Loudness 服务（响度均衡：EBU R128 测量 + 回放增益补偿）
+// ---------------------------------------------------------------------------
+
+// LoudnessService 响度测量与补偿
+type LoudnessService struct {
+	mgr *loudness.Manager
+	lib *library.Manager
+	app *application.App
+
+	// virtual 按 id 取「不在曲库里、但磁盘上有真实文件」的歌曲（在线试听）。
+	//
+	// ★ 为什么响度服务也需要它（真实缺口）：
+	//
+	//	在线试听曲目的 id 形如 bili:BVxxx，而 lib.SongByID 只认扫描出来的
+	//	本地曲目 —— 于是 Get/Measure 一律以「歌曲不存在」失败，在线试听
+	//	**完全不受响度均衡约束**。
+	//
+	//	修这条链路时前端曾经用 `if (!song.online)` 把在线曲目挡在门外，
+	//	那只让「查不到」变得不再报错，代价是功能彻底缺失。正解是让这类
+	//	曲目也能被解析到：音频其实已经落在磁盘上（见
+	//	media.Server.RegisterVirtual），响度测量只要有路径就能跑。
+	//
+	// 注入的是读取函数而不是 media.Server 本身：响度服务不该依赖 HTTP
+	// 服务层，测试里也能用一个假函数喂虚拟曲目。为 nil 时安全降级为
+	// 「只认曲库」（即修复前的行为）。
+	virtual func(id string) (bootstrap.Song, bool)
+
+	mu        sync.Mutex
+	cancel    context.CancelFunc
+	measuring bool
+	// lastTarget 记住最近一次用到的目标响度，供 State() 在没有入参时判断
+	// 「已测量」到底是多少首（缓存有效性与目标响度绑定）。
+	lastTarget float64
+}
+
+// NewLoudnessService 构造服务
+func NewLoudnessService(mgr *loudness.Manager, lib *library.Manager) *LoudnessService {
+	return &LoudnessService{mgr: mgr, lib: lib, lastTarget: defaultTarget}
+}
+
+// setVirtualResolver 注入「在线试听曲目」的来源（main.go 装配时调用）。
+// 不注入时行为与修复前一致：只认曲库。
+func (s *LoudnessService) setVirtualResolver(fn func(string) (bootstrap.Song, bool)) {
+	s.mu.Lock()
+	s.virtual = fn
+	s.mu.Unlock()
+}
+
+// songByID 解析一首歌：先查曲库，再查在线虚拟表。
+//
+// 顺序与 media.Server.lookupSong 保持一致（曲库优先）。两者不可能撞 id：
+// 本地 id 是路径派生，在线 id 带 bili: 前缀。
+//
+// 查不到时返回的 error 文案保持原样，前端依赖它区分「真的没有这首歌」
+// 与「测量失败」。
+func (s *LoudnessService) songByID(songID string) (bootstrap.Song, error) {
+	if song, ok := s.lib.SongByID(songID); ok {
+		return song, nil
+	}
+	// 在线曲目走这里。注意虚拟表只在音频**已经落到本地缓存**之后才有条目
+	// （EnsureCached 下载完才登记），所以「查不到」是正常时序而非错误 ——
+	// 前端稍后会重试一次，届时条目已就位。
+	s.mu.Lock()
+	lookup := s.virtual
+	s.mu.Unlock()
+	if lookup != nil {
+		if song, ok := lookup(songID); ok {
+			return song, nil
+		}
+	}
+	return bootstrap.Song{}, fmt.Errorf("歌曲不存在: %s", songID)
+}
+
+// defaultTarget 前端没给目标值时的兜底（与前端 DEFAULT_CONFIG 保持一致）
+const defaultTarget = -16.0
+
+// normTarget 归一化目标响度，并记住它
+func (s *LoudnessService) normTarget(t float64) float64 {
+	if t == 0 {
+		t = defaultTarget
+	}
+	s.mu.Lock()
+	s.lastTarget = t
+	s.mu.Unlock()
+	return t
+}
+
+func (s *LoudnessService) currentTarget() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastTarget == 0 {
+		return defaultTarget
+	}
+	return s.lastTarget
+}
+
+// State 返回响度测量能力与进度概况
+func (s *LoudnessService) State() map[string]any {
+	t := s.mgr.Tools()
+	songs := s.lib.Songs()
+	target := s.currentTarget()
+	// ★ 「已测量」不再按标准统计：测量与挡位无关（见 internal/loudness 的
+	// 包注释）。用户在四个挡位之间切换都不会让这个数字变化 —— 因为它本来
+	// 描述的就是「有多少首歌已经量过响度」。
+	measured := s.mgr.CountValid(songs)
+	return map[string]any{
+		"available": s.mgr.Available(),
+		"source":    t.Source,
+		"describe":  t.Describe(),
+		"path":      t.FFmpeg,
+		"measured":  measured,
+		"cached":    s.mgr.Count(),
+		"missing":   len(songs) - measured,
+		"total":     len(songs),
+		"target":    target,
+		"algo":      loudness.AlgoVersion,
+		"measuring": s.isMeasuring(),
+		"cachePath": s.mgr.CachePath(),
+		"onDemand":  true,
+		// concurrency 是实际生效的测量并发（默认 2，刻意压小以免风扇狂转）
+		"concurrency": s.mgr.Concurrency(),
+		// gains 是已缓存的挡位增益条数（一万首 × 四挡 = 四万），
+		// 用来回答「换挡位到底要不要重算」——正常情况下它只增不减。
+		"gains": s.mgr.GainCount(),
+	}
+}
+
+// Get 取一首歌的测量结果与补偿增益。
+//
+// ★ 换挡位是零成本的：测量结果与挡位无关，所以这里要么直接命中已缓存的
+// 该挡位增益，要么用已有的测量结果现场算一次（纯算术），**绝不会**因为
+// 「换了个挡位」就重新测量。
+//
+// 在线试听曲目也走这里（经 songByID 的虚拟表兜底）：它们的音频在本地
+// 缓存里，测量条件与本地曲目完全一样。
+func (s *LoudnessService) Get(songID string, targetLUFS float64) (map[string]any, error) {
+	song, err := s.songByID(songID)
+	if err != nil {
+		return nil, err
+	}
+	target := s.normTarget(targetLUFS)
+
+	gain, ok := s.mgr.GainFor(song, target)
+	if !ok {
+		return map[string]any{"measured": false, "target": target}, nil
+	}
+	item, _ := s.mgr.Get(song)
+	_ = s.mgr.Save()
+	return map[string]any{
+		"measured":   true,
+		"integrated": item.Integrated,
+		"truePeak":   item.TruePeak,
+		"lra":        item.LRA,
+		"gainDB":     gain,
+		"target":     target,
+	}, nil
+}
+
+// Measure 测量单首歌 —— 这是常规路径：用户播到哪首就测哪首，不预先全库扫描。
+// 前端在开始播放时调用，测完立刻套用补偿。
+//
+// 在线试听曲目同样支持：只要它的音频已经下载到本地缓存（前端播放在线曲目
+// 时后端会先 EnsureCached），就能像本地文件一样测量。测出的记录按
+// Path/Size/ModTime 进同一个缓存 —— 这几个量对在线曲目是稳定的，
+// 所以第二次试听同一首歌会直接命中缓存，不会重复跑 ffmpeg。
+//
+// ★ 走的是**高优先级**队列（PriorityInterrupt）：如果后台正在批量预热整库，
+// 这首歌会插到队首 —— 这正是「优先处理正在播放的那首歌」。
+func (s *LoudnessService) Measure(songID string, targetLUFS float64) (map[string]any, error) {
+	song, err := s.songByID(songID)
+	if err != nil {
+		return nil, err
+	}
+	target := s.normTarget(targetLUFS)
+
+	// 已经测过（含转码时顺手算出来的）就直接返回，不进队列、不起 ffmpeg。
+	if g, ok := s.mgr.GainFor(song, target); ok {
+		item, _ := s.mgr.Get(song)
+		_ = s.mgr.Save()
+		return measureResult(item, g, target), nil
+	}
+	if !s.mgr.Available() {
+		return nil, fmt.Errorf("ffmpeg 不可用，无法测量响度")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	item, err := s.mgr.Submit(ctx, song, loudness.PriorityInterrupt)
+	if err != nil {
+		return nil, err
+	}
+	gain, _ := s.mgr.GainFor(song, target)
+	// 单曲测量也要落盘，下次播放直接命中缓存
+	_ = s.mgr.Save()
+	return measureResult(item, gain, target), nil
+}
+
+// measureResult 组装单曲测量的返回结构（字段名是前端契约，不要改）
+func measureResult(item loudness.Measurement, gain, target float64) map[string]any {
+	return map[string]any{
+		"measured":   true,
+		"integrated": item.Integrated,
+		"truePeak":   item.TruePeak,
+		"lra":        item.LRA,
+		"gainDB":     gain,
+		"target":     target,
+	}
+}
+
+// InvalidateTarget 兼容旧接口。
+//
+// ★ 正常换挡**一行都不删**（返回 dropped=0 且不落盘）；只有「增益自述的
+// 目标与它所在槽位不符」的坏数据才会被清掉，那时返回 >0 并落盘。
+//
+// 历史上这个方法是「把 target 不等于当前值的记录全删掉」，代价是用户每换
+// 一次挡位就丢掉整库已算好的结果 —— 四个挡位来回切就是反复重算同一批歌，
+// 那正是用户报的「从较响改回默认时，较响算好的补偿丢了」。
+//
+// 现在测量与挡位解耦：换挡位只意味着增益按新目标现算（纯算术，几纳秒），
+// 没有任何缓存需要失效。保留这个方法只是为了不动前端绑定。
+func (s *LoudnessService) InvalidateTarget(targetLUFS float64) map[string]any {
+	target := s.normTarget(targetLUFS)
+	// 仍然做一次自校验清理（只丢"目标值与自述不符"的坏条目），
+	// 但正常情况下这里永远是 0 条。
+	dropped := s.mgr.InvalidateTarget(target)
+	if dropped > 0 {
+		_ = s.mgr.Save()
+	}
+	return map[string]any{
+		"dropped": dropped,
+		"target":  target,
+		"state":   s.State(),
+	}
+}
+
+// MeasureAll 后台批量预热整个曲库（可选，正常使用不需要）。
+// 异步执行，进度通过 loudness:progress 事件推送。
+//
+// ★ 它走**低优先级**队列：一旦用户点开某首歌（走 Measure 的高优先级通道），
+// 预热会让出槽位，先测用户正在听的那首。并发默认压到 2，避免把 CPU 铺满。
+func (s *LoudnessService) MeasureAll(targetLUFS float64) map[string]any {
+	s.normTarget(targetLUFS)
+	if !s.mgr.Available() {
+		return map[string]any{"started": false, "reason": "ffmpeg 不可用"}
+	}
+	s.mu.Lock()
+	if s.measuring {
+		s.mu.Unlock()
+		return map[string]any{"started": false, "reason": "already-measuring"}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.measuring = true
+	s.mu.Unlock()
+
+	songs := s.lib.Songs()
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			s.measuring = false
+			s.cancel = nil
+			s.mu.Unlock()
+			_ = s.mgr.Save()
+		}()
+
+		done, failed, err := s.mgr.MeasureAll(ctx, songs, func(p loudness.Progress) {
+			s.emit("loudness:progress", map[string]any{
+				"done": p.Done, "total": p.Total,
+				"failed": p.Failed, "current": p.Current, "finished": p.Finished,
+			})
+		})
+		payload := map[string]any{"done": done, "failed": failed, "total": len(songs)}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			payload["message"] = err.Error()
+			s.emit("loudness:failed", payload)
+			return
+		}
+		s.emit("loudness:done", payload)
+	}()
+
+	return map[string]any{"started": true, "total": len(songs)}
+}
+
+// Cancel 中止批量测量
+func (s *LoudnessService) Cancel() {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Clear 清空测量缓存
+func (s *LoudnessService) Clear() error {
+	return s.mgr.Clear()
+}
+
+// GainMap 返回「songId → 补偿增益 dB」映射，供前端批量套用。
+//
+// ★ 换挡位零成本的落点：这张表由**已有的测量结果**现算出来，
+// 不需要为另一个挡位重新测量任何一首歌。用户从「较响」切到「默认」时，
+// 整个曲库的补偿在这一个调用里就全部就位（每首几纳秒的算术），
+// 而不是排一个几十分钟的队。
+//
+// 没测过的歌不在其中，前端播到那首时会走 Measure 按需补算。
+//
+// 注意这里刻意**只遍历曲库**：在线试听曲目没有稳定的「专辑归属」，
+// 把它们塞进批量表既会让这张随曲库变化的映射多出易失条目，也会让
+// 「按专辑统一」失去意义。在线曲目走 Get/Measure 的按需路径（track 模式），
+// 测出来的记录同样进缓存、下次试听直接命中。
+func (s *LoudnessService) GainMap(targetLUFS float64) map[string]float64 {
+	target := s.normTarget(targetLUFS)
+	out := map[string]float64{}
+	for _, song := range s.lib.Songs() {
+		if g, ok := s.mgr.GainFor(song, target); ok {
+			out[song.ID] = g
+		}
+	}
+	// 把这一挡位新算出的增益落盘，下次启动直接命中（每个挡位只写一次）
+	_ = s.mgr.Save()
+	return out
+}
+
+// AlbumGains 返回按专辑聚合的补偿增益（「整张专辑统一」模式）
+//
+// 与 GainMap 同理，只对曲库内歌曲分组：在线试听曲目不属于任何本地专辑，
+// 在 album 模式下它们保持不补偿（「查不到就不抬升也不压低」，与
+// frontend/src/js/audio.js#gainDBFor 的既有安全语义一致）。
+func (s *LoudnessService) AlbumGains(targetLUFS float64) map[string]float64 {
+	target := s.normTarget(targetLUFS)
+	// 按专辑分组
+	groups := map[string][]bootstrap.Song{}
+	for _, song := range s.lib.Songs() {
+		album := strings.TrimSpace(song.Album)
+		if album == "" || album == "未知专辑" {
+			album = "__unknown__"
+		}
+		groups[album] = append(groups[album], song)
+	}
+
+	out := map[string]float64{}
+	for name, songs := range groups {
+		s.mgr.UpdateAlbum(name, songs)
+		if g, ok := s.mgr.AlbumGainDB(name, target); ok {
+			for _, song := range songs {
+				out[song.ID] = g
+			}
+		}
+	}
+	_ = s.mgr.Save()
+	return out
+}
+
+// StoreMeasurement 把「转码时顺手算出来」的测量结果记进缓存。
+//
+// 由 main 装配层挂在 media.Server 的扫描钩子上（见 SetLoudnessSink）。
+// 它是响度测量**唯一不需要跑 ffmpeg 的入口**：转码播放本来就要解码整首歌，
+// 顺手把响度算出来即可，不再需要第二遍解码。
+//
+// 这里同时把当前挡位的增益算好记下（GainFor 会做），这样播放到这首歌时
+// 补偿已经就位 —— 用户感受到的是「响度均衡不需要等待」。
+func (s *LoudnessService) StoreMeasurement(song bootstrap.Song, res loudness.Measurement) {
+	if !res.Measured && res.Integrated == 0 && res.TruePeak == 0 {
+		// 空结果（解码失败/全静音）：不写入，免得留下一条"测过但没有数据"
+		// 的记录挡住后续的正常测量。
+		return
+	}
+	res.Measured = true
+	target := s.currentTarget()
+	s.mgr.StoreAndGain(song, res, target)
+	// 落盘：这一步很便宜（只有变化时才写），但能让结论跨进程复用。
+	_ = s.mgr.Save()
+}
+
+// RefreshTools 重新探测 ffmpeg（设置界面点「重新检测」时用）
+func (s *LoudnessService) RefreshTools() map[string]any {
+	s.mgr.RefreshTools()
+	return s.State()
+}
+
+func (s *LoudnessService) isMeasuring() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.measuring
+}
+
+func (s *LoudnessService) emit(name string, payload any) {
+	if s.app == nil {
+		return
+	}
+	s.app.Event.Emit(name, payload)
+}
+
+// ---------------------------------------------------------------------------
+// 工具函数
+// ---------------------------------------------------------------------------
+
+func appendUnique(base []string, items ...string) []string {
+	seen := make(map[string]bool, len(base)+len(items))
+	for _, b := range base {
+		seen[b] = true
+	}
+	for _, it := range items {
+		if it == "" || seen[it] {
+			continue
+		}
+		seen[it] = true
+		base = append(base, it)
+	}
+	return base
+}
+
+func moveIndex[T any](list []T, from, to int) []T {
+	if from < 0 || from >= len(list) {
+		return list
+	}
+	if to < 0 {
+		to = 0
+	}
+	if to > len(list) {
+		to = len(list)
+	}
+	out := make([]T, len(list))
+	copy(out, list)
+	item := out[from]
+	rest := append(out[:from:from], out[from+1:]...)
+	if to > len(rest) {
+		to = len(rest)
+	}
+	res := make([]T, 0, len(list))
+	res = append(res, rest[:to]...)
+	res = append(res, item)
+	res = append(res, rest[to:]...)
+	return res
+}
+
+func sanitizeFileName(name string) string {
+	replacer := strings.NewReplacer("\\", "_", "/", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	return replacer.Replace(strings.TrimSpace(name))
+}
+
+func revealPath(path string) error {
+	// 用 executil.CommandVisible 而不是 Command：Windows 上 explorer 是 GUI
+	// 程序，带 SW_HIDE / CREATE_NO_WINDOW 启动时它新建的文件夹窗口也会是隐藏的
+	// （用户看到「提示成功但没反应」）。ffmpeg 这类控制台程序才需要隐藏窗口。
+	switch runtime.GOOS {
+	case "windows":
+		return executil.CommandVisible("explorer", path).Start()
+	case "darwin":
+		return executil.CommandVisible("open", path).Start()
+	default:
+		return executil.CommandVisible("xdg-open", path).Start()
+	}
+}
+
+// applyPatch 把前端传来的 map 写进配置（只处理已知键）
+func applyPatch(c *bootstrap.Config, patch map[string]any) {
+	for key, raw := range patch {
+		switch key {
+		case "theme":
+			c.Theme = asString(raw, c.Theme)
+		case "themeMode":
+			c.ThemeMode = asString(raw, c.ThemeMode)
+		case "glassBlur":
+			c.GlassBlur = asInt(raw, c.GlassBlur)
+		case "glassAlpha":
+			c.GlassAlpha = asInt(raw, c.GlassAlpha)
+		case "windowCorners":
+			c.WindowCorners = bootstrap.NormalizeWindowCorners(asString(raw, c.WindowCorners))
+		case "animations":
+			c.Animations = asBool(raw, c.Animations)
+		case "animationsSpeed":
+			c.AnimationsSpeed = bootstrap.NormalizeAnimationsSpeed(asString(raw, c.AnimationsSpeed))
+		case "accentFromCover":
+			c.AccentFromCover = asBool(raw, c.AccentFromCover)
+		case "coverSeed":
+			// 封面取色的结果（前端算好之后写回）：只接受 #rgb / #rrggbb，
+			// 其它内容一律忽略 —— 这个值会被 early_theme.go 直接拼进 CSS。
+			c.CoverSeed = sanitizeSeedColor(asString(raw, c.CoverSeed))
+		case "coverSeed2":
+			c.CoverSeed2 = sanitizeSeedColor(asString(raw, c.CoverSeed2))
+		case "showAlbumColumn":
+			c.ShowAlbumColumn = asBool(raw, c.ShowAlbumColumn)
+		case "showLyrics":
+			c.ShowLyrics = asBool(raw, c.ShowLyrics)
+		case "playMode":
+			c.PlayMode = asString(raw, c.PlayMode)
+		case "volume":
+			c.Volume = asFloat(raw, c.Volume)
+		case "muted":
+			c.Muted = asBool(raw, c.Muted)
+		case "playerViewMode":
+			c.PlayerViewMode = asString(raw, c.PlayerViewMode)
+		// —— 播放界面背景动效帧率 ——
+		// ★ 这个键曾经被漏掉：前端 SYNCED_KEYS 有它、Config 有它，只有这里没有 case。
+		// 后果与前几行注释里的响度三兄弟一模一样：用户改完「背景动效帧率」，
+		// 前端会把它推到后端，后端静默丢弃；下次启动 hydrateFromBackend 用后端的
+		// 旧值（smooth）覆盖界面 —— 表现是「设置自己变回去了」，没有任何报错。
+		case "skinPerformanceMode":
+			// 在这里就规范化，与 Load 时的兜底同一份白名单（见
+			// bootstrap.NormalizeSkinPerformanceMode）：非法值当场落回 smooth，
+			// 而不是先存进去、等下次启动才被纠正（那期间界面与行为不一致）。
+			c.SkinPerformanceMode = bootstrap.NormalizeSkinPerformanceMode(asString(raw, c.SkinPerformanceMode))
+		case "autoScanOnStart":
+			c.AutoScanOnStart = asBool(raw, c.AutoScanOnStart)
+		case "watchFolders":
+			prev := c.WatchFolders
+			c.WatchFolders = asBool(raw, c.WatchFolders)
+			if prev != c.WatchFolders {
+				for i := range c.Folders {
+					c.Folders[i].Watching = c.WatchFolders
+				}
+			}
+		case "scanConcurrency":
+			c.ScanConcurrency = asInt(raw, c.ScanConcurrency)
+		case "lyricsFontSize":
+			c.LyricsFontSize = asInt(raw, c.LyricsFontSize)
+		case "lyricsLines":
+			c.LyricsLines = asInt(raw, c.LyricsLines)
+		case "lyricsSources":
+			if list, ok := raw.([]any); ok {
+				out := make([]string, 0, len(list))
+				for _, v := range list {
+					if s, ok := v.(string); ok {
+						out = append(out, s)
+					}
+				}
+				// 规范化：去重、去掉未知项、补齐 cache 等缺项。
+				// 前端只会把「拖过的顺序」推上来，合法性由后端兜住。
+				c.LyricsSources = lyrics.NormalizeSources(out)
+			}
+		case "filterRules":
+			if list, ok := raw.([]any); ok {
+				rules := make([]bootstrap.FilterRule, 0, len(list))
+				for _, item := range list {
+					m, ok := item.(map[string]any)
+					if !ok {
+						continue
+					}
+					rules = append(rules, bootstrap.FilterRule{
+						ID:      asString(m["id"], bootstrap.RandomID("rule")),
+						Type:    asString(m["type"], "regex"),
+						Op:      asString(m["op"], "match"),
+						Value:   asString(m["value"], ""),
+						Unit:    asString(m["unit"], "B"),
+						Scope:   asString(m["scope"], "exclude"),
+						Enabled: asBool(m["enabled"], true),
+					})
+				}
+				c.FilterRules = rules
+			}
+		case "cacheDir":
+			c.CacheDir = asString(raw, c.CacheDir)
+		// —— 响度均衡 ——
+		// 这几个键以前被漏掉了：前端一直在推，后端不认，于是设置里的
+		// 「均衡模式 / 目标响度 / 真峰值保护」重启后一律回到默认值。
+		case "loudnessMode":
+			mode := strings.TrimSpace(asString(raw, c.LoudnessMode))
+			switch mode {
+			case "off", "track", "album":
+				c.LoudnessMode = mode
+			default:
+				// 非法值不静默接受，免得界面显示与实际行为不一致
+				c.LoudnessMode = "off"
+			}
+		case "loudnessTarget":
+			c.LoudnessTarget = asFloat(raw, c.LoudnessTarget)
+		case "loudnessLimit":
+			c.LoudnessLimit = asBool(raw, c.LoudnessLimit)
+		// —— 在线功能 ——
+		case "downloadDir":
+			c.DownloadDir = bootstrap.ExpandPath(asString(raw, c.DownloadDir))
+		case "onlineCover":
+			c.OnlineCover = asBool(raw, c.OnlineCover)
+		case "onlineWordLyrics":
+			c.OnlineWordLyrics = asBool(raw, c.OnlineWordLyrics)
+		case "embedMeta":
+			c.EmbedMeta = asBool(raw, c.EmbedMeta)
+		// —— 交互 ——
+		case "rowClickAction":
+			c.RowClickAction = bootstrap.NormalizeRowClickAction(asString(raw, c.RowClickAction))
+		case "resumeProgress":
+			// 播放进度本身由前端随快照保存，后端只记这个开关
+			c.ResumeProgress = asBool(raw, c.ResumeProgress)
+		case "rememberVolume":
+			c.RememberVolume = asBool(raw, c.RememberVolume)
+		case "listDensity":
+			c.ListDensity = bootstrap.NormalizeListDensity(asString(raw, c.ListDensity))
+		case "minimizeToTray":
+			// 前端开关的落盘路径。运行时那半（创建 / 销毁托盘图标）走
+			// WindowService.SetMinimizeToTray，与这里是同一个值，顺序无所谓。
+			c.MinimizeToTray = asBool(raw, c.MinimizeToTray)
+		case "showDesktopLyrics":
+			c.ShowDesktopLyrics = asBool(raw, c.ShowDesktopLyrics)
+		case "showDesktopWallpaper":
+			// 前端（desktop-wallpaper.js）一直在推这个键，但这里以前没有对应分支，
+			// 于是「桌面背景歌词」从未落盘：功能当场可用，重启就没了。
+			// 与 showDesktopLyrics 对称；两者的互斥规范化在 config 层统一处理。
+			//
+			// 注意它只表示**本次运行**开着：要不要在下次启动时自动恢复由
+			// autoStartDesktopWallpaper 决定（见 bootstrap.Config.StartupDesktopMode）。
+			c.ShowDesktopWallpaper = asBool(raw, c.ShowDesktopWallpaper)
+		case "autoStartDesktopWallpaper":
+			// 「启动时自动打开桌面背景歌词」。关掉之后本次仍然可以手动打开，
+			// 只是下次启动不再自动出现 —— 也就是「只在本次启动生效」。
+			c.AutoStartDesktopWallpaper = asBool(raw, c.AutoStartDesktopWallpaper)
+			// 顺手纠正一份自相矛盾的配置：自动启动关着、但「本次开着」却是 true，
+			// 那多半是用户刚刚在设置里关掉自动启动、却又没有关掉当前这个窗口。
+			// 这种状态本身是合法的（本次确实开着），所以**不**在这里改
+			// ShowDesktopWallpaper；只在两者都为 false 时没有任何要做的。
+			// （这里保留成显式的空分支说明，避免以后有人误以为漏写了什么。）
+		case "sleepAfterSong":
+			c.SleepAfterSong = asBool(raw, c.SleepAfterSong)
+		case "aiVendor":
+			// 非法值不静默接受：思考开关发错字段会被服务端直接拒
+			if v := strings.TrimSpace(asString(raw, c.AIVendor)); isValidAIVendor(v) && v != "" {
+				c.AIVendor = v
+			}
+		case "coverCarousel":
+			c.CoverCarousel = asBool(raw, c.CoverCarousel)
+		case "coverCarouselInterval":
+			// 下限 2 秒：比这更快的轮播只会变成闪烁
+			c.CoverCarouselInterval = bootstrap.NormalizeCarouselInterval(asInt(raw, c.CoverCarouselInterval))
+		case "shuffleMode":
+			if asString(raw, c.ShuffleMode) == "once" {
+				c.ShuffleMode = "once"
+			} else {
+				c.ShuffleMode = "reshuffle"
+			}
+		// —— 跳过静音与切歌间隔 ——
+		// 三个键都要有对应分支：前端 flushConfigSync 一直在推，
+		// 漏掉任何一个都会变成「开关能动、看起来生效了，重启后什么都没变」
+		//（这正是响度那几个键以前踩过的坑，见上面的注释）。
+		case "skipSilenceHead":
+			c.SkipSilenceHead = asBool(raw, c.SkipSilenceHead)
+		case "skipSilenceTail":
+			c.SkipSilenceTail = asBool(raw, c.SkipSilenceTail)
+		case "trackGapSeconds":
+			// 0 是合法值（不留间隔），规范化只在越界时收敛。
+			c.TrackGapSeconds = bootstrap.NormalizeTrackGapSeconds(asFloat(raw, c.TrackGapSeconds))
+		case "effectPreset":
+			// 音效档位：非法值落回 off（见 NormalizeEffectPreset 的说明）。
+			//
+			// ★ 这个键必须有分支：前端 flushConfigSync 一直在推，
+			// 漏掉它就变成「音效能用、看起来生效了，重启后回到关闭」——
+			// 与下面注释里提到的响度那几个键踩过的是同一个坑。
+			c.EffectPreset = bootstrap.NormalizeEffectPreset(asString(raw, c.EffectPreset))
+		case "aiBaseUrl":
+			// AI 接口地址：能规范化就规范化（漏协议 / 多尾斜杠），**非法值照存**
+			// —— 丢掉用户输入会变成「改了设置、一刷新就没了」。真正的闸门在
+			// 发请求那一处（services_ai.go#ExtractMeta），见 NormalizeAIBaseURL。
+			//
+			// 与 rowClickAction / listDensity / effectPreset 同一写法：键自己的
+			// 分支里收敛一次，normalize() 在读盘时再收敛一次（老配置 / 手改配置）。
+			c.AIBaseURL = bootstrap.NormalizeAIBaseURLStored(asString(raw, c.AIBaseURL))
+		case "aiApiKey":
+			// ★ 忽略回传的占位串。
+			//
+			// Get() 交给前端的密钥是打码过的（见 maskSecret），前端在用户
+			// 没改这个字段时会把占位串原样推回来。若这里照写，用户每改一次
+			// 别的设置都会把自己的密钥抹成占位串 —— 属于静默的数据丢失。
+			v := strings.TrimSpace(asString(raw, ""))
+			if isMaskedSecret(v) {
+				break
+			}
+			c.AIAPIKey = v
+		case "aiThinking":
+			c.AIThinking = asBool(raw, c.AIThinking)
+		case "aiModelId":
+			c.AIModelID = strings.TrimSpace(asString(raw, c.AIModelID))
+		case "aiLyricsClean":
+			// 自动匹配歌词时是否先用 AI 清洗元数据（AI 慢，用户可关）
+			c.AILyricsClean = asBool(raw, c.AILyricsClean)
+		case "aiDownloadTag":
+			// 下载完成后是否用 AI 提取元数据并写回文件（会改写用户文件，可关）
+			c.AIDownloadTag = asBool(raw, c.AIDownloadTag)
+		case "autoDownloadOnCollect":
+			// 收藏 / 加入歌单时，是否把「只有试听缓存」的在线歌曲自动下载到本地
+			c.AutoDownloadOnCollect = asBool(raw, c.AutoDownloadOnCollect)
+		}
+	}
+}
+
+func asString(v any, def string) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return def
+}
+
+func asInt(v any, def int) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return def
+}
+
+func asFloat(v any, def float64) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	}
+	return def
+}
+
+func asBool(v any, def bool) bool {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return def
+}
+
+// sanitizeSeedColor 规范化封面取色的结果：只保留 #rgb / #rrggbb，其它一律丢弃。
+//
+// 这个值会被 early_theme.go 直接拼进 <html> 的行内样式，所以必须在这里收紧；
+// 非法输入（用户手改配置、旧版本字段）返回空串 = 「没有取色记录」。
+func sanitizeSeedColor(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) != 4 && len(v) != 7 {
+		return ""
+	}
+	if v[0] != '#' {
+		return ""
+	}
+	for _, r := range v[1:] {
+		isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+		if !isHex {
+			return ""
+		}
+	}
+	return strings.ToLower(v)
+}
+
+// readSongCache 读取元数据缓存里登记过的文件路径（导出 m3u 用，避免再次扫盘）
+func readSongCache(dataDir string) map[string]string {
+	out := map[string]string{}
+	raw, err := os.ReadFile(filepath.Join(dataDir, "metadata-cache.json"))
+	if err != nil {
+		return out
+	}
+	var payload struct {
+		Entries map[string]json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return out
+	}
+	for path := range payload.Entries {
+		out[bootstrap.StableID(path, "t")] = path
+	}
+	return out
+}
